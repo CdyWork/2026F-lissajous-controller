@@ -75,7 +75,7 @@ gw_sh FPGA\build.tcl
 
 仿真必须显示 `MODELSIM_RESULT: PASS`。PnR 必须无 setup/hold violation，且
 BSRAM 保持为 0。先下载 `FPGA/impl/pnr/f2026.fs` 到 SRAM，确认 LCD 显示
-`FPGA ONLINE`、串口 `STATUS` 返回 `COMM=1 VER=2` 后再写外部 Flash。
+`FPGA ONLINE`、串口 `STATUS` 返回 `COMM=1 VER=3` 后再写外部 Flash。
 
 ## 台架验收顺序
 
@@ -99,7 +99,8 @@ BSRAM 保持为 0。先下载 `FPGA/impl/pnr/f2026.fs` 到 SRAM，确认 LCD 显
   hold slack +0.275 ns。
 - STM32F407：Flash 60620 B，RAM 36700 B；OpenOCD 写入并校验成功。
 - FPGA：外部 Flash `0x0B4017` 擦写和校验成功，从 Flash 重新配置后串口
-  返回 `COMM=1 VER=2`。
+  返回 `COMM=1 VER=2`。V2 探测模式当前验证为 SRAM 下载，协议回读
+  `COMM=1 VER=3`。
 - FPGA 位流 SHA-256：
   `ECE388139F7CA871893032CAD93A57DC32C2C6971B439C9BEA195A8E7EC42C9E`。
 - MCU ELF SHA-256：

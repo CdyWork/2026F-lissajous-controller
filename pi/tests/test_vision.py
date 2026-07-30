@@ -98,9 +98,10 @@ class SerialProtocolTests(unittest.TestCase):
         link.set_frequency_hz(100002.4)
         link.set_phase_degrees(-90.0)
         link.set_auto_mode("circle")
+        link.request_probe(200)
         self.assertEqual(
             link.commands,
-            ["FREQ 100002", "PHASE 270", "AUTO CIRCLE"],
+            ["FREQ 100002", "PHASE 270", "AUTO CIRCLE", "PROBE 200"],
         )
 
 

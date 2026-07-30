@@ -4,13 +4,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define F2026_FPGA_PROTOCOL_VERSION 2U
+#define F2026_FPGA_PROTOCOL_VERSION 3U
 
 typedef enum {
     F2026_FPGA_MODE_IDLE = 0,
     F2026_FPGA_MODE_DIAGONAL = 1,
     F2026_FPGA_MODE_CIRCLE = 2,
-    F2026_FPGA_MODE_DOUBLE = 3
+    F2026_FPGA_MODE_DOUBLE = 3,
+    F2026_FPGA_MODE_PROBE = 4
 } F2026_FpgaMode;
 
 typedef struct {
@@ -24,6 +25,7 @@ typedef struct {
     uint8_t sample_min;
     uint8_t sample_max;
     F2026_FpgaMode mode;
+    uint8_t probe_ramp_mode;
     uint8_t amplitude_code;
 } F2026_FpgaStatus;
 
@@ -36,6 +38,7 @@ typedef struct {
     uint32_t phase_offset;
     uint8_t dac_mid;
     uint8_t threshold_hysteresis;
+    uint8_t probe_ramp_mode;
 } F2026_FpgaControl;
 
 void F2026_FpgaInterfaceInit(void);

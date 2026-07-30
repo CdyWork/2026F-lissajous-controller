@@ -48,9 +48,9 @@ class McuLink:
         self.command(f"AUTO {normalized}")
 
     def request_probe(self, ramp_us: int) -> None:
-        raise NotImplementedError(
-            "STM32 firmware has no Q5 PROBE command yet; this is the reserved integration point"
-        )
+        if ramp_us not in {100, 200, 500, 1000, 2000, 5000}:
+            raise ValueError(f"unsupported probe ramp: {ramp_us} us")
+        self.command(f"PROBE {ramp_us}")
 
     def __enter__(self) -> "McuLink":
         return self
@@ -80,3 +80,8 @@ class RecordingMcuLink:
         if normalized not in VALID_MODES:
             raise ValueError(f"unsupported auto mode: {mode}")
         self.command(f"AUTO {normalized}")
+
+    def request_probe(self, ramp_us: int) -> None:
+        if ramp_us not in {100, 200, 500, 1000, 2000, 5000}:
+            raise ValueError(f"unsupported probe ramp: {ramp_us} us")
+        self.command(f"PROBE {ramp_us}")

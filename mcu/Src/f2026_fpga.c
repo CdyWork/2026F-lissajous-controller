@@ -91,6 +91,7 @@ bool F2026_FpgaReadStatus(F2026_FpgaStatus *status)
     status->sample_min = rx[12];
     status->sample_max = rx[13];
     status->mode = (F2026_FpgaMode)(rx[14] & 0x07U);
+    status->probe_ramp_mode = (uint8_t)(rx[14] >> 3U);
     status->amplitude_code = rx[15];
     return true;
 }
@@ -113,6 +114,7 @@ bool F2026_FpgaWriteControl(const F2026_FpgaControl *control)
     pack_u32_le(&tx[8], control->phase_offset);
     tx[12] = control->dac_mid;
     tx[13] = control->threshold_hysteresis;
+    tx[14] = control->probe_ramp_mode;
     return transfer_frame(tx, rx);
 }
 

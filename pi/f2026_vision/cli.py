@@ -166,7 +166,8 @@ def build_parser() -> argparse.ArgumentParser:
     image.add_argument("--calibration", type=Path)
     image.add_argument("--save-calibration", type=Path)
     image.add_argument("--debug-dir", type=Path)
-    image.add_argument("--ramp-us", type=int, default=1000, choices=(500, 1000))
+    image.add_argument("--ramp-us", type=int, default=1000,
+                       choices=(100, 200, 500, 1000, 2000, 5000))
     image.set_defaults(handler=run_image)
 
     camera = subparsers.add_parser("camera", help="measure from OV5647")
@@ -177,7 +178,8 @@ def build_parser() -> argparse.ArgumentParser:
     camera.add_argument("--process-fps", type=float, default=30.0)
     camera.add_argument("--exposure-us", type=int, default=800)
     camera.add_argument("--gain", type=float, default=16.0)
-    camera.add_argument("--ramp-us", type=int, default=1000, choices=(500, 1000))
+    camera.add_argument("--ramp-us", type=int, default=1000,
+                        choices=(100, 200, 500, 1000, 2000, 5000))
     camera.add_argument("--coarse-seconds", type=float, default=0.8)
     camera.add_argument("--phase-seconds", type=float, default=1.2)
     camera.add_argument("--serial")

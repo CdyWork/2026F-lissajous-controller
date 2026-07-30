@@ -24,7 +24,8 @@ module f2026_spi_control (
     output reg  [31:0] phase_increment = 32'd0,
     output reg  [31:0] phase_offset = 32'd0,
     output reg  [7:0]  dac_mid = 8'h80,
-    output reg  [7:0]  threshold_hysteresis = 8'd3
+    output reg  [7:0]  threshold_hysteresis = 8'd3,
+    output reg  [7:0]  probe_ramp_mode = 8'd1
 );
     localparam [7:0] CMD_READ_STATUS = 8'h01;
     localparam [7:0] CMD_SET_CONTROL = 8'h10;
@@ -45,6 +46,7 @@ module f2026_spi_control (
     reg [31:0] staged_phase_offset = 32'd0;
     reg [7:0] staged_dac_mid = 8'h80;
     reg [7:0] staged_hysteresis = 8'd3;
+    reg [7:0] staged_probe_ramp_mode = 8'd1;
     reg previous_locked = 1'b0;
     reg previous_otr = 1'b0;
 
@@ -68,7 +70,7 @@ module f2026_spi_control (
         if (command == CMD_READ_STATUS) begin
             case (byte_index)
                 12'd0:  tx_byte = 8'hF6;
-                12'd1:  tx_byte = 8'h02;
+                12'd1:  tx_byte = 8'h03;
                 12'd2:  tx_byte = {4'd0, free_run, output_active, otr_seen, input_locked};
                 12'd3:  tx_byte = period_ticks[7:0];
                 12'd4:  tx_byte = period_ticks[15:8];
@@ -80,7 +82,7 @@ module f2026_spi_control (
                 12'd10: tx_byte = edge_count[31:24];
                 12'd11: tx_byte = sample_min;
                 12'd12: tx_byte = sample_max;
-                12'd13: tx_byte = {5'd0, mode};
+                12'd13: tx_byte = {probe_ramp_mode[4:0], mode};
                 12'd14: tx_byte = amplitude;
                 default: tx_byte = 8'h00;
             endcase
@@ -99,6 +101,7 @@ module f2026_spi_control (
             phase_offset <= 32'd0;
             dac_mid <= 8'h80;
             threshold_hysteresis <= 8'd3;
+            probe_ramp_mode <= 8'd1;
             previous_locked <= 1'b0;
             previous_otr <= 1'b0;
             irq <= 1'b0;
@@ -118,6 +121,7 @@ module f2026_spi_control (
                 staged_phase_offset <= phase_offset;
                 staged_dac_mid <= dac_mid;
                 staged_hysteresis <= threshold_hysteresis;
+                staged_probe_ramp_mode <= probe_ramp_mode;
             end
 
             if (rx_byte_valid) begin
@@ -139,6 +143,7 @@ module f2026_spi_control (
                         12'd11: staged_phase_offset[31:24] <= rx_byte;
                         12'd12: staged_dac_mid <= rx_byte;
                         12'd13: staged_hysteresis <= rx_byte;
+                        12'd14: staged_probe_ramp_mode <= rx_byte;
                         default: begin end
                     endcase
                 end
@@ -154,6 +159,7 @@ module f2026_spi_control (
                     dac_mid <= staged_dac_mid;
                     threshold_hysteresis <= staged_hysteresis;
                     phase_offset <= staged_phase_offset;
+                    probe_ramp_mode <= staged_probe_ramp_mode;
                 end
                 if (command == CMD_READ_STATUS)
                     irq <= 1'b0;

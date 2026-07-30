@@ -10,6 +10,7 @@ module f2026_waveform_core (
     input  wire [7:0]  dac_mid,
     input  wire [31:0] phase_increment,
     input  wire [31:0] phase_offset,
+    input  wire [7:0]  probe_ramp_mode,
     input  wire        input_edge,
     input  wire        input_locked,
     output reg  [7:0]  dac_data = 8'h80,
@@ -19,9 +20,22 @@ module f2026_waveform_core (
     localparam [2:0] MODE_DIAGONAL = 3'd1;
     localparam [2:0] MODE_CIRCLE   = 3'd2;
     localparam [2:0] MODE_DOUBLE   = 3'd3;
+    localparam [2:0] MODE_PROBE    = 3'd4;
+    localparam [31:0] PROBE_FRAME_TICKS = 32'd500000;
     reg [31:0] base_phase = 32'd0;
     reg signed [11:0] sine_pipeline = 12'sd0;
     reg signed [20:0] product_pipeline = 21'sd0;
+    reg [31:0] probe_counter = 32'd0;
+    reg [32:0] probe_error = 33'd0;
+
+    wire [31:0] probe_ramp_ticks =
+        (probe_ramp_mode == 8'd0) ? 32'd25000 :
+        (probe_ramp_mode == 8'd2) ? 32'd100000 :
+        (probe_ramp_mode == 8'd3) ? 32'd250000 :
+        (probe_ramp_mode == 8'd4) ? 32'd5000 :
+        (probe_ramp_mode == 8'd5) ? 32'd10000 :
+                                    32'd50000;
+    wire [32:0] probe_error_next = probe_error + 33'd102;
 
     function signed [11:0] sine_from_phase;
         input [31:0] phase;
@@ -111,6 +125,8 @@ module f2026_waveform_core (
             base_phase <= 32'd0;
             sine_pipeline <= 12'sd0;
             product_pipeline <= 21'sd0;
+            probe_counter <= 32'd0;
+            probe_error <= 33'd0;
             phase_monitor <= 32'd0;
             dac_data <= 8'h80;
         end else begin
@@ -118,8 +134,35 @@ module f2026_waveform_core (
                 base_phase <= 32'd0;
                 sine_pipeline <= 12'sd0;
                 product_pipeline <= 21'sd0;
+                probe_counter <= 32'd0;
+                probe_error <= 33'd0;
                 phase_monitor <= 32'd0;
                 dac_data <= dac_mid;
+            end else if (mode == MODE_PROBE) begin
+                base_phase <= 32'd0;
+                sine_pipeline <= 12'sd0;
+                product_pipeline <= 21'sd0;
+                phase_monitor <= 32'd0;
+
+                if (probe_counter == PROBE_FRAME_TICKS - 1) begin
+                    probe_counter <= 32'd0;
+                    probe_error <= 33'd0;
+                    dac_data <= 8'd77;
+                end else begin
+                    probe_counter <= probe_counter + 1'b1;
+                    if (probe_counter < probe_ramp_ticks - 1) begin
+                        if (probe_error_next >= probe_ramp_ticks) begin
+                            probe_error <= probe_error_next - probe_ramp_ticks;
+                            if (dac_data < 8'd179)
+                                dac_data <= dac_data + 1'b1;
+                        end else begin
+                            probe_error <= probe_error_next;
+                        end
+                    end else begin
+                        probe_error <= 33'd0;
+                        dac_data <= 8'hFF;
+                    end
+                end
             end else begin
                 base_phase <= base_phase_next;
                 phase_monitor <= selected_phase;

@@ -17,10 +17,9 @@ signal processing; no trained neural-network model is required.
 - adapter for the STM32 ASCII UART protocol already present in `mcu/`;
 - offline tests against the independent Q5 image simulator.
 
-The current STM32/FPGA production firmware does not yet provide a `PROBE`
-command or a 40/48-bit DDS word. `serial_link.McuLink.request_probe()` is an
-explicit integration point and deliberately raises `NotImplementedError`.
-The existing integer `FREQ`, `PHASE`, and `AUTO` commands are supported.
+V2 STM32/FPGA firmware provides a `PROBE <ramp_us>` command over the Pi UART.
+The supported ramp values are 100, 200, 500, 1000, 2000, and 5000 us. The
+existing integer `FREQ`, `PHASE`, and `AUTO` commands are also supported.
 
 ## Raspberry Pi installation
 
@@ -54,10 +53,10 @@ python3 main.py image camera_frame.png --ramp-us 1000 \
   --save-calibration scope_calibration.json --debug-dir debug
 ```
 
-For 70-100 kHz, use a 0.5 ms probe after the FPGA has switched its probe:
+For 70-100 kHz, use a 0.1-0.2 ms probe after the FPGA has switched its probe:
 
 ```bash
-python3 main.py image camera_frame.png --ramp-us 500
+python3 main.py image camera_frame.png --ramp-us 100
 ```
 
 The JSON result includes continuous frequency, the selected 100 Hz bin, fitted
@@ -75,10 +74,9 @@ python3 main.py camera \
   --ramp-us 1000 --coarse-seconds 0.8 --phase-seconds 1.2
 ```
 
-Use `--serial /dev/serial0 --apply --mode DIAG` only after the probe waveform
-is controlled externally/current firmware has been extended. `--apply` sends
-the measured integer frequency and selected automatic mode using the existing
-STM32 protocol.
+Use `--serial /dev/serial0 --apply --mode DIAG` after the probe waveform has
+been selected with `PROBE <ramp_us>`. `--apply` sends the measured integer
+frequency and selected automatic mode using the STM32 protocol.
 
 The program prints both the requested exposure and the OV5647 supported range.
 Every captured frame also carries the achieved exposure from camera metadata.

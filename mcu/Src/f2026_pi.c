@@ -11,6 +11,8 @@
 static char line_buffer[F2026_PI_LINE_SIZE];
 static uint8_t line_length;
 
+static bool poll_uart(UART_HandleTypeDef *huart, F2026_PiCommand *command);
+
 static F2026_FpgaMode parse_mode(const char *text)
 {
     if (strcmp(text, "DIAG") == 0) {
@@ -21,6 +23,9 @@ static F2026_FpgaMode parse_mode(const char *text)
     }
     if (strcmp(text, "DOUBLE") == 0) {
         return F2026_FPGA_MODE_DOUBLE;
+    }
+    if (strcmp(text, "PROBE") == 0) {
+        return F2026_FPGA_MODE_PROBE;
     }
     return F2026_FPGA_MODE_IDLE;
 }
@@ -66,6 +71,9 @@ static bool parse_line(F2026_PiCommand *command)
     } else if ((strcmp(verb, "PHASE") == 0) && (arg1 != 0)) {
         command->type = F2026_PI_COMMAND_PHASE;
         command->value = strtoul(arg1, 0, 10);
+    } else if ((strcmp(verb, "PROBE") == 0) && (arg1 != 0)) {
+        command->type = F2026_PI_COMMAND_PROBE;
+        command->value = strtoul(arg1, 0, 10);
     } else if ((strcmp(verb, "CAL") == 0) && (arg1 != 0) && (arg2 != 0)) {
         command->type = F2026_PI_COMMAND_CALIBRATE;
         command->value = strtoul(arg1, 0, 10);
@@ -78,20 +86,30 @@ static bool parse_line(F2026_PiCommand *command)
 void F2026_PiInit(void)
 {
     line_length = 0U;
-    BSP_UART_InitMode(BSP_UART_MODE_TX_RX, BSP_UART_MODE_TX_ONLY);
+    BSP_UART_InitMode(BSP_UART_MODE_TX_RX, BSP_UART_MODE_TX_RX);
+    (void)BSP_UART3_StartReceiveDMA();
     (void)BSP_UART1_StartReceiveDMA();
     F2026_PiReply("F2026 READY\r\n");
 }
 
 bool F2026_PiPoll(F2026_PiCommand *command)
 {
-    uint8_t byte;
-
     if (command == 0) {
         return false;
     }
 
-    while (BSP_UART_ReadBuffered(&huart1, &byte, 1U) == 1U) {
+    if (poll_uart(&huart3, command)) {
+        return true;
+    }
+
+    return poll_uart(&huart1, command);
+}
+
+static bool poll_uart(UART_HandleTypeDef *huart, F2026_PiCommand *command)
+{
+    uint8_t byte;
+
+    while (BSP_UART_ReadBuffered(huart, &byte, 1U) == 1U) {
         char ch = (char)byte;
 
         if ((ch == '\r') || (ch == '\n')) {
@@ -121,6 +139,7 @@ bool F2026_PiPoll(F2026_PiCommand *command)
 void F2026_PiReply(const char *text)
 {
     if (text != 0) {
+        (void)BSP_UART_Transmit(&huart3, (const uint8_t *)text, (uint16_t)strlen(text), 100U);
         (void)BSP_UART1_Print(text);
     }
 }

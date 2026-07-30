@@ -48,6 +48,7 @@ module f2026_top (
     wire [31:0] phase_offset;
     wire [7:0] dac_mid;
     wire [7:0] threshold_hysteresis;
+    wire [7:0] probe_ramp_mode;
     wire [7:0] effective_threshold_hysteresis;
     wire [31:0] phase_monitor;
     wire [31:0] tracked_phase_increment;
@@ -131,7 +132,8 @@ module f2026_top (
                low_frequency_phase_calibration +
                tracking_latency_phase));
     assign output_active = output_enable && (mode != 3'd0) &&
-        (free_run ? (phase_increment != 32'd0) : tracked_output_qualified);
+        ((mode == 3'd4) ? 1'b1 :
+         (free_run ? (phase_increment != 32'd0) : tracked_output_qualified));
 
     always @(posedge clk_50m) begin
         if (!reset_n || free_run || !output_enable || (mode == 3'd0)) begin
@@ -171,7 +173,8 @@ module f2026_top (
         .phase_increment(phase_increment),
         .phase_offset(phase_offset),
         .dac_mid(dac_mid),
-        .threshold_hysteresis(threshold_hysteresis)
+        .threshold_hysteresis(threshold_hysteresis),
+        .probe_ramp_mode(probe_ramp_mode)
     );
 
     f2026_waveform_core waveform_inst (
@@ -184,6 +187,7 @@ module f2026_top (
         .dac_mid(dac_mid),
         .phase_increment(effective_phase_increment),
         .phase_offset(effective_phase_offset),
+        .probe_ramp_mode(probe_ramp_mode),
         .input_edge(input_edge),
         .input_locked(input_locked),
         .dac_data(da_data),

@@ -24,6 +24,7 @@ typedef struct {
     uint8_t amplitude_codes[4];
     uint32_t free_frequency_hz;
     uint32_t user_phase_word;
+    uint8_t probe_ramp_mode;
     F2026_FpgaStatus fpga_status;
     F2026_FpgaControl last_control;
     bool last_control_valid;
@@ -39,6 +40,7 @@ static F2026_State state = {
     .amplitude_codes = {13U, 26U, 38U, 51U},
     .free_frequency_hz = 1000U,
     .user_phase_word = 0U,
+    .probe_ramp_mode = 1U,
     .last_control_valid = false,
     .communication_ok = false,
     .output_active = false
@@ -53,6 +55,8 @@ static void F2026_DrawStatus(void);
 static void F2026_SendPiStatus(void);
 static const char *F2026_ModeName(F2026_FpgaMode mode);
 static int F2026_AmplitudeIndex(uint32_t divisions);
+static int F2026_ProbeRampMode(uint32_t ramp_us);
+static uint32_t F2026_ProbeRampUs(uint8_t ramp_mode);
 
 void F2026_AppStart(void)
 {
@@ -139,9 +143,12 @@ static void F2026_ApplyControl(void)
     control.phase_offset = state.user_phase_word;
     control.dac_mid = 0x80U;
     control.threshold_hysteresis = 3U;
+    control.probe_ramp_mode = state.probe_ramp_mode;
 
     if (state.mode != F2026_FPGA_MODE_IDLE) {
-        if (state.free_run) {
+        if (state.mode == F2026_FPGA_MODE_PROBE) {
+            control.output_enable = true;
+        } else if (state.free_run) {
             control.phase_increment =
                 F2026_PhaseIncrementFromHz(state.free_frequency_hz);
             control.output_enable = control.phase_increment != 0U;
@@ -239,6 +246,17 @@ static void F2026_ServicePi(void)
             state.user_phase_word = F2026_PhaseWordFromDegrees(command.value);
             F2026_PiReply("OK PHASE\r\n");
             break;
+        case F2026_PI_COMMAND_PROBE:
+            amplitude_index = F2026_ProbeRampMode(command.value);
+            if (amplitude_index >= 0) {
+                state.mode = F2026_FPGA_MODE_PROBE;
+                state.free_run = true;
+                state.probe_ramp_mode = (uint8_t)amplitude_index;
+                F2026_PiReply("OK PROBE\r\n");
+            } else {
+                F2026_PiReply("ERR PROBE\r\n");
+            }
+            break;
         case F2026_PI_COMMAND_CALIBRATE:
             amplitude_index = F2026_AmplitudeIndex(command.value);
             if ((amplitude_index >= 0) &&
@@ -327,11 +345,12 @@ static void F2026_SendPiStatus(void)
 
     (void)snprintf(response,
                    sizeof(response),
-                   "STATUS MODE=%s AUTO=%u AMP=%u FREQ=%lu LOCK=%u ADC=%u,%u OTR=%u OUTPUT=%u COMM=%u FOUT=%u VER=%u\r\n",
+                   "STATUS MODE=%s AUTO=%u AMP=%u FREQ=%lu RAMP=%lu LOCK=%u ADC=%u,%u OTR=%u OUTPUT=%u COMM=%u FOUT=%u VER=%u\r\n",
                    F2026_ModeName(state.mode),
                    state.free_run ? 1U : 0U,
                    amplitude_divisions[state.amplitude_index],
                    (unsigned long)frequency_hz,
+                   (unsigned long)F2026_ProbeRampUs(state.fpga_status.probe_ramp_mode),
                    state.fpga_status.locked ? 1U : 0U,
                    state.fpga_status.sample_min,
                    state.fpga_status.sample_max,
@@ -352,9 +371,50 @@ static const char *F2026_ModeName(F2026_FpgaMode mode)
         return "CIRCLE";
     case F2026_FPGA_MODE_DOUBLE:
         return "DOUBLE";
+    case F2026_FPGA_MODE_PROBE:
+        return "PROBE";
     case F2026_FPGA_MODE_IDLE:
     default:
         return "IDLE";
+    }
+}
+
+static int F2026_ProbeRampMode(uint32_t ramp_us)
+{
+    switch (ramp_us) {
+    case 100U:
+        return 4;
+    case 200U:
+        return 5;
+    case 500U:
+        return 0;
+    case 1000U:
+        return 1;
+    case 2000U:
+        return 2;
+    case 5000U:
+        return 3;
+    default:
+        return -1;
+    }
+}
+
+static uint32_t F2026_ProbeRampUs(uint8_t ramp_mode)
+{
+    switch (ramp_mode) {
+    case 0U:
+        return 500U;
+    case 2U:
+        return 2000U;
+    case 3U:
+        return 5000U;
+    case 4U:
+        return 100U;
+    case 5U:
+        return 200U;
+    case 1U:
+    default:
+        return 1000U;
     }
 }
 
