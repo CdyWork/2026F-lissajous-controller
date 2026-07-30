@@ -17,6 +17,8 @@
 
 #define F2026_TASK_STACK_WORDS 768U
 #define F2026_TASK_PRIORITY (tskIDLE_PRIORITY + 2U)
+#define F2026_DEFAULT_PHASE_DEGREES 14U
+#define F2026_DEFAULT_PHASE_WORD 0x09F49F49U
 typedef struct {
     F2026_FpgaMode mode;
     bool free_run;
@@ -38,7 +40,7 @@ static F2026_State state = {
     .amplitude_index = 3U,
     .amplitude_codes = {13U, 26U, 38U, 51U},
     .free_frequency_hz = 1000U,
-    .user_phase_word = 0U,
+    .user_phase_word = F2026_DEFAULT_PHASE_WORD,
     .last_control_valid = false,
     .communication_ok = false,
     .output_active = false
