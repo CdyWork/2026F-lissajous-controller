@@ -88,6 +88,7 @@ bool F2026_FpgaReadStatus(F2026_FpgaStatus *status)
     status->free_run = (flags & 0x08U) != 0U;
     status->period_ticks = unpack_u32_le(&rx[4]);
     status->edge_count = unpack_u32_le(&rx[8]);
+    status->average_period_q8 = status->edge_count;
     status->sample_min = rx[12];
     status->sample_max = rx[13];
     status->mode = (F2026_FpgaMode)(rx[14] & 0x07U);

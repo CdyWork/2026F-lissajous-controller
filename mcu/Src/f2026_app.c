@@ -12,6 +12,7 @@
 #include "task.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -19,6 +20,18 @@
 #define F2026_TASK_PRIORITY (tskIDLE_PRIORITY + 2U)
 #define F2026_DEFAULT_PHASE_DEGREES 14U
 #define F2026_DEFAULT_PHASE_WORD 0x09F49F49U
+#define F2026_DEFAULT_DAC_MID 0x80U
+#define F2026_DOUBLE_PHASE_DEGREES 31U
+#define F2026_DOUBLE_PHASE_WORD 0x160B60B6U
+#define F2026_MIN_TRACK_FREQUENCY_HZ 1000U
+#define F2026_MAX_TRACK_FREQUENCY_HZ 100000U
+#define F2026_FREQUENCY_STEP_HZ 100U
+#define F2026_FREQ_CAL_MID_START_HZ 50100U
+#define F2026_FREQ_CAL_HIGH_START_HZ 87200U
+#define F2026_TRACKING_PHASE_CALIBRATION_WORD 0xFE93E93FU
+#define F2026_LOW_FREQUENCY_PHASE_BASE_WORD 0xFE38E38EU
+#define F2026_LOW_FREQUENCY_INCREMENT_LIMIT_WORD 1065152U
+#define F2026_TRACKING_LATENCY_CYCLES 53U
 typedef struct {
     F2026_FpgaMode mode;
     bool free_run;
@@ -55,6 +68,15 @@ static void F2026_DrawStatus(void);
 static void F2026_SendPiStatus(void);
 static const char *F2026_ModeName(F2026_FpgaMode mode);
 static int F2026_AmplitudeIndex(uint32_t divisions);
+static uint32_t F2026_CurrentFrequencyHz(void);
+static uint32_t F2026_QuantizeFrequencyHz(uint32_t frequency_hz);
+static uint32_t F2026_PhaseOffsetForMode(F2026_FpgaMode mode,
+                                         uint32_t frequency_hz,
+                                         bool tracking);
+static uint32_t F2026_TrackingCompensationWord(F2026_FpgaMode mode,
+                                               uint32_t frequency_hz);
+static uint16_t F2026_TrackingPhaseCorrectionTenthDegrees(uint32_t frequency_hz);
+static uint32_t F2026_PhaseWordFromTenthDegrees(uint32_t tenth_degrees);
 
 void F2026_AppStart(void)
 {
@@ -134,12 +156,14 @@ static void F2026_Task(void *argument)
 static void F2026_ApplyControl(void)
 {
     F2026_FpgaControl control;
+    uint32_t frequency_hz = F2026_CurrentFrequencyHz();
     memset(&control, 0, sizeof(control));
     control.mode = state.mode;
     control.amplitude_code = state.amplitude_codes[state.amplitude_index];
     control.free_run = state.free_run;
-    control.phase_offset = state.user_phase_word;
-    control.dac_mid = 0x80U;
+    control.phase_offset =
+        F2026_PhaseOffsetForMode(state.mode, frequency_hz, !state.free_run);
+    control.dac_mid = F2026_DEFAULT_DAC_MID;
     control.threshold_hysteresis = 3U;
 
     if (state.mode != F2026_FPGA_MODE_IDLE) {
@@ -148,9 +172,10 @@ static void F2026_ApplyControl(void)
                 F2026_PhaseIncrementFromHz(state.free_frequency_hz);
             control.output_enable = control.phase_increment != 0U;
         } else {
-            // Tracking frequency, phase correction and loss-of-lock muting are
-            // autonomous in the FPGA. The MCU only arms the selected mode.
-            control.output_enable = true;
+            // The FPGA still locks the DDS on every input edge. Frequency-
+            // dependent phase compensation is kept deterministic in the MCU,
+            // so wait for a locked averaged period before enabling output.
+            control.output_enable = (frequency_hz != 0U);
         }
     }
 
@@ -262,14 +287,8 @@ static void F2026_ServicePi(void)
 
 static void F2026_DrawStatus(void)
 {
-    uint32_t frequency_hz = 0U;
+    uint32_t frequency_hz = F2026_CurrentFrequencyHz();
     uint16_t status_color = state.communication_ok ? BSP_LCD_GREEN : BSP_LCD_RED;
-
-    if (state.free_run) {
-        frequency_hz = state.free_frequency_hz;
-    } else if (state.fpga_status.period_ticks != 0U) {
-        frequency_hz = 50000000U / state.fpga_status.period_ticks;
-    }
 
     BSP_LCD_Clear(BSP_LCD_BLACK);
     BSP_LCD_FillRect(0U, 0U, BSP_LCD_WIDTH, 14U, BSP_LCD_BLUE);
@@ -284,7 +303,9 @@ static void F2026_DrawStatus(void)
     BSP_LCD_ShowU32(48U, 36U, amplitude_divisions[state.amplitude_index],
                     BSP_LCD_WHITE, BSP_LCD_BLACK);
     BSP_LCD_ShowString(80U, 36U, "CODE", BSP_LCD_CYAN, BSP_LCD_BLACK);
-    BSP_LCD_ShowU32(120U, 36U, state.amplitude_codes[state.amplitude_index],
+    BSP_LCD_ShowU32(120U, 36U,
+                    state.last_control_valid ? state.last_control.amplitude_code :
+                                               state.amplitude_codes[state.amplitude_index],
                     BSP_LCD_WHITE, BSP_LCD_BLACK);
 
     BSP_LCD_ShowString(0U, 52U, "FREQ", BSP_LCD_CYAN, BSP_LCD_BLACK);
@@ -323,16 +344,16 @@ static void F2026_DrawStatus(void)
 static void F2026_SendPiStatus(void)
 {
     char response[192];
-    uint32_t frequency_hz = state.free_run ? state.free_frequency_hz :
-        ((state.fpga_status.period_ticks == 0U)
-             ? 0U : (50000000U / state.fpga_status.period_ticks));
+    uint32_t frequency_hz = F2026_CurrentFrequencyHz();
 
     (void)snprintf(response,
                    sizeof(response),
-                   "STATUS MODE=%s AUTO=%u AMP=%u FREQ=%lu LOCK=%u ADC=%u,%u OTR=%u OUTPUT=%u COMM=%u FOUT=%u VER=%u\r\n",
+                   "STATUS MODE=%s AUTO=%u AMP=%u CODE=%u FREQ=%lu LOCK=%u ADC=%u,%u OTR=%u OUTPUT=%u COMM=%u FOUT=%u VER=%u\r\n",
                    F2026_ModeName(state.mode),
                    state.free_run ? 1U : 0U,
                    amplitude_divisions[state.amplitude_index],
+                   state.last_control_valid ? state.last_control.amplitude_code :
+                                              state.amplitude_codes[state.amplitude_index],
                    (unsigned long)frequency_hz,
                    state.fpga_status.locked ? 1U : 0U,
                    state.fpga_status.sample_min,
@@ -367,6 +388,144 @@ static int F2026_AmplitudeIndex(uint32_t divisions)
             return (int)i;
     }
     return -1;
+}
+
+static uint32_t F2026_CurrentFrequencyHz(void)
+{
+    uint32_t frequency_hz = 0U;
+
+    if (state.free_run) {
+        frequency_hz = state.free_frequency_hz;
+    } else if (!state.fpga_status.locked) {
+        return 0U;
+    } else if (state.fpga_status.average_period_q8 != 0U) {
+        frequency_hz =
+            (uint32_t)((50000000ULL * 256ULL +
+                        (state.fpga_status.average_period_q8 / 2ULL)) /
+                       state.fpga_status.average_period_q8);
+    }
+
+    return F2026_QuantizeFrequencyHz(frequency_hz);
+}
+
+static uint32_t F2026_QuantizeFrequencyHz(uint32_t frequency_hz)
+{
+    if (frequency_hz == 0U) {
+        return 0U;
+    }
+
+    frequency_hz =
+        ((frequency_hz + (F2026_FREQUENCY_STEP_HZ / 2U)) /
+         F2026_FREQUENCY_STEP_HZ) *
+        F2026_FREQUENCY_STEP_HZ;
+
+    if (frequency_hz >= F2026_FREQ_CAL_HIGH_START_HZ) {
+        frequency_hz -= 200U;
+    } else if (frequency_hz >= F2026_FREQ_CAL_MID_START_HZ) {
+        frequency_hz -= 100U;
+    }
+
+    if (frequency_hz < F2026_MIN_TRACK_FREQUENCY_HZ) {
+        return F2026_MIN_TRACK_FREQUENCY_HZ;
+    }
+    if (frequency_hz > F2026_MAX_TRACK_FREQUENCY_HZ) {
+        return F2026_MAX_TRACK_FREQUENCY_HZ;
+    }
+    return frequency_hz;
+}
+
+static uint32_t F2026_PhaseOffsetForMode(F2026_FpgaMode mode,
+                                         uint32_t frequency_hz,
+                                         bool tracking)
+{
+    uint32_t phase_offset;
+
+    if (mode == F2026_FPGA_MODE_DOUBLE) {
+        phase_offset =
+            F2026_DOUBLE_PHASE_WORD -
+            F2026_PhaseWordFromTenthDegrees(
+                2U * F2026_TrackingPhaseCorrectionTenthDegrees(frequency_hz));
+    } else {
+        phase_offset =
+            state.user_phase_word -
+            F2026_PhaseWordFromTenthDegrees(
+                F2026_TrackingPhaseCorrectionTenthDegrees(frequency_hz));
+    }
+
+    if (tracking) {
+        phase_offset += F2026_TrackingCompensationWord(mode, frequency_hz);
+    }
+
+    return phase_offset;
+}
+
+static uint32_t F2026_TrackingCompensationWord(F2026_FpgaMode mode,
+                                               uint32_t frequency_hz)
+{
+    uint32_t phase_increment;
+    uint32_t latency_phase;
+    uint32_t low_frequency_phase = 0U;
+
+    if (frequency_hz == 0U) {
+        return 0U;
+    }
+
+    phase_increment = F2026_PhaseIncrementFromHz(frequency_hz);
+    latency_phase = phase_increment * F2026_TRACKING_LATENCY_CYCLES;
+
+    if (phase_increment <= F2026_LOW_FREQUENCY_INCREMENT_LIMIT_WORD) {
+        low_frequency_phase =
+            F2026_LOW_FREQUENCY_PHASE_BASE_WORD + (phase_increment * 28U);
+    }
+
+    return F2026_TRACKING_PHASE_CALIBRATION_WORD +
+           low_frequency_phase +
+           ((mode == F2026_FPGA_MODE_DOUBLE) ? (latency_phase * 2U) :
+                                               latency_phase);
+}
+
+static uint16_t F2026_TrackingPhaseCorrectionTenthDegrees(uint32_t frequency_hz)
+{
+    uint32_t frequency_khz;
+    int64_t correction_scaled;
+
+    if (frequency_hz == 0U) {
+        return 0U;
+    }
+    if (frequency_hz < 5000U) {
+        frequency_hz = 5000U;
+    } else if (frequency_hz > 100000U) {
+        frequency_hz = 100000U;
+    }
+
+    frequency_khz = (frequency_hz + 500U) / 1000U;
+
+    // Smooth curve fit for the latest single-frequency bench data.
+    // x = frequency in kHz, y = correction in tenth-degrees.
+    // y ~= 1.398501e-6*x^5 - 3.390005e-4*x^4 + 2.921774e-2*x^3
+    //      - 1.067705*x^2 + 17.7423866*x - 65.3999567
+    // Coefficients are scaled by 1e12 and evaluated with Horner's method.
+    correction_scaled = 1398501LL;
+    correction_scaled = correction_scaled * (int64_t)frequency_khz - 339000463LL;
+    correction_scaled = correction_scaled * (int64_t)frequency_khz + 29217737569LL;
+    correction_scaled = correction_scaled * (int64_t)frequency_khz - 1067704804504LL;
+    correction_scaled = correction_scaled * (int64_t)frequency_khz + 17742386603967LL;
+    correction_scaled = correction_scaled * (int64_t)frequency_khz - 65399956657636LL;
+
+    if (correction_scaled <= 0LL) {
+        return 0U;
+    }
+    correction_scaled = (correction_scaled + 500000000000LL) / 1000000000000LL;
+    if (correction_scaled > 3600LL) {
+        correction_scaled = 3600LL;
+    }
+    return (uint16_t)correction_scaled;
+}
+
+static uint32_t F2026_PhaseWordFromTenthDegrees(uint32_t tenth_degrees)
+{
+    tenth_degrees %= 3600U;
+    return (uint32_t)((((uint64_t)tenth_degrees << 32U) + 1800ULL) / 3600ULL);
 }
 
 void vApplicationMallocFailedHook(void)

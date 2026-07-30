@@ -21,6 +21,7 @@ typedef struct {
     bool free_run;
     uint32_t period_ticks;
     uint32_t edge_count;
+    uint32_t average_period_q8;
     uint8_t sample_min;
     uint8_t sample_max;
     F2026_FpgaMode mode;

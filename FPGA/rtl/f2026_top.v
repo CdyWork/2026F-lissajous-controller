@@ -19,15 +19,6 @@ module f2026_top (
     // immediately to DAC midpoint draws a horizontal line in oscilloscope XY
     // mode even when the input re-locks a few cycles later.
     localparam [18:0] LOCK_HOLD_TICKS = 19'd250000; // 5 ms at 50 MHz
-    // Bench fit over 10..100 kHz. Because the DAC path uses mid-sine, the
-    // measured output-minus-input phase moves opposite to this phase word.
-    // 0xFE93E93F is -2 degrees in a 32-bit phase accumulator.
-    localparam [31:0] TRACKING_PHASE_CALIBRATION = 32'hFE93_E93F;
-    // Additional low-frequency fit from the 1 kHz and 5 kHz bench points:
-    // -2.5 degrees + 0.2016 degrees/kHz, clamped to zero above 12.4 kHz.
-    localparam [31:0] LOW_FREQUENCY_PHASE_BASE = 32'hFE38_E38E;
-    localparam [31:0] LOW_FREQUENCY_INCREMENT_LIMIT = 32'd1065152;
-
     wire reset_n;
     reg ad_clk_reg = 1'b0;
     wire sample_ce = ~ad_clk_reg;
@@ -36,6 +27,7 @@ module f2026_top (
     wire input_locked;
     wire [31:0] period_ticks;
     wire [31:0] edge_count;
+    wire [31:0] average_period_q8;
     wire [7:0] sample_min;
     wire [7:0] sample_max;
     wire otr_seen;
@@ -52,8 +44,6 @@ module f2026_top (
     wire [31:0] phase_monitor;
     wire [31:0] tracked_phase_increment;
     wire tracked_increment_valid;
-    wire [31:0] tracking_latency_phase;
-    wire [31:0] low_frequency_phase_calibration;
     wire [31:0] effective_phase_increment;
     wire [31:0] effective_phase_offset;
     wire output_active;
@@ -90,6 +80,7 @@ module f2026_top (
         .locked(input_locked),
         .period_ticks(period_ticks),
         .edge_count(edge_count),
+        .average_period_q8(average_period_q8),
         .sample_min(sample_min),
         .sample_max(sample_max),
         .otr_seen(otr_seen)
@@ -103,33 +94,13 @@ module f2026_top (
         .valid(tracked_increment_valid)
     );
 
-    // 53 = 32 + 16 + 4 + 1. Keep the fixed delay compensation in LUT carry
-    // chains so the waveform multiplier remains the only DSP consumer.
-    assign tracking_latency_phase =
-        (tracked_phase_increment << 5) +
-        (tracked_phase_increment << 4) +
-        (tracked_phase_increment << 2) +
-        tracked_phase_increment;
-    // 28 = 16 + 8 + 4. Arithmetic intentionally wraps modulo 2^32,
-    // matching the phase accumulator representation for negative angles.
-    assign low_frequency_phase_calibration =
-        (tracked_phase_increment <= LOW_FREQUENCY_INCREMENT_LIMIT)
-            ? (LOW_FREQUENCY_PHASE_BASE +
-               (tracked_phase_increment << 4) +
-               (tracked_phase_increment << 3) +
-               (tracked_phase_increment << 2))
-            : 32'd0;
     assign effective_phase_increment = free_run
         ? phase_increment : tracked_phase_increment;
-    assign effective_phase_offset = free_run
-        ? phase_offset
-        : ((mode == 3'd3)
-            ? (phase_offset + TRACKING_PHASE_CALIBRATION +
-               low_frequency_phase_calibration +
-               {tracking_latency_phase[30:0], 1'b0})
-            : (phase_offset + TRACKING_PHASE_CALIBRATION +
-               low_frequency_phase_calibration +
-               tracking_latency_phase));
+    // Keep FPGA phase locking stateless: every valid input edge re-aligns the
+    // DDS in f2026_waveform_core, while all frequency-dependent phase
+    // compensation is calculated once in the MCU from the reported average
+    // period. This prevents different phase results for sweep-in vs re-plug-in.
+    assign effective_phase_offset = phase_offset;
     assign output_active = output_enable && (mode != 3'd0) &&
         (free_run ? (phase_increment != 32'd0) : tracked_output_qualified);
 
@@ -161,7 +132,7 @@ module f2026_top (
         .output_active(output_active),
         .otr_seen(otr_seen),
         .period_ticks(period_ticks),
-        .edge_count(edge_count),
+        .edge_count(average_period_q8),
         .sample_min(sample_min),
         .sample_max(sample_max),
         .mode(mode),

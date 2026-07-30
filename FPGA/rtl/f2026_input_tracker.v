@@ -11,6 +11,7 @@ module f2026_input_tracker (
     output reg         locked = 1'b0,
     output reg [31:0]  period_ticks = 32'd0,
     output reg [31:0]  edge_count = 32'd0,
+    output reg [31:0]  average_period_q8 = 32'd0,
     output reg [7:0]   sample_min = 8'h80,
     output reg [7:0]   sample_max = 8'h80,
     output reg         otr_seen = 1'b0
@@ -33,6 +34,8 @@ module f2026_input_tracker (
     reg [15:0] window_count = 16'd0;
     reg [7:0] window_min = 8'hFF;
     reg [7:0] window_max = 8'h00;
+    reg [22:0] average_period_sum = 23'd0;
+    reg [6:0] average_period_count = 7'd0;
 
     wire [8:0] threshold_low_wide = 9'd128 - {1'b0, threshold_hysteresis};
     wire [8:0] threshold_high_wide = 9'd128 + {1'b0, threshold_hysteresis};
@@ -72,9 +75,12 @@ module f2026_input_tracker (
             locked <= 1'b0;
             period_ticks <= 32'd0;
             edge_count <= 32'd0;
+            average_period_q8 <= 32'd0;
             window_count <= 16'd0;
             window_min <= 8'hFF;
             window_max <= 8'h00;
+            average_period_sum <= 23'd0;
+            average_period_count <= 7'd0;
             sample_min <= 8'h80;
             sample_max <= 8'h80;
             otr_seen <= 1'b0;
@@ -85,6 +91,12 @@ module f2026_input_tracker (
                 locked <= 1'b0;
                 valid_edges <= 3'd0;
                 jump_candidate_valid <= 1'b0;
+                seen_edge <= 1'b0;
+                period_ticks <= 32'd0;
+                period_filter_q8 <= 40'd0;
+                average_period_q8 <= 32'd0;
+                average_period_sum <= 23'd0;
+                average_period_count <= 7'd0;
             end
 
             if (ad_otr)
@@ -120,11 +132,25 @@ module f2026_input_tracker (
                         jump_candidate_valid <= 1'b0;
                     end else if ((period_counter >= MIN_PERIOD_TICKS) &&
                                  (period_counter <= MAX_PERIOD_TICKS)) begin
+                        if (average_period_count == 7'd127) begin
+                            average_period_q8 <=
+                                ({9'd0, average_period_sum} + period_counter) << 1;
+                            average_period_sum <= 23'd0;
+                            average_period_count <= 7'd0;
+                        end else begin
+                            average_period_sum <=
+                                average_period_sum + period_counter[22:0];
+                            average_period_count <= average_period_count + 1'b1;
+                        end
+
                         if (period_ticks == 0) begin
                             period_ticks <= period_counter;
                             period_filter_q8 <= measured_period_q8;
                             valid_edges <= 3'd1;
                             jump_candidate_valid <= 1'b0;
+                            average_period_q8 <= period_counter << 8;
+                            average_period_sum <= period_counter[22:0];
+                            average_period_count <= 7'd1;
                         end else if (period_matches_filter) begin
                             period_filter_q8 <= filter_next;
                             period_ticks <= filtered_period_next;
@@ -143,16 +169,25 @@ module f2026_input_tracker (
                             valid_edges <= 3'd2;
                             locked <= 1'b0;
                             jump_candidate_valid <= 1'b0;
+                            average_period_q8 <= period_counter << 8;
+                            average_period_sum <= period_counter[22:0];
+                            average_period_count <= 7'd1;
                         end else begin
                             jump_candidate_period <= period_counter;
                             jump_candidate_valid <= 1'b1;
                             valid_edges <= 3'd0;
                             locked <= 1'b0;
+                            average_period_q8 <= 32'd0;
+                            average_period_sum <= 23'd0;
+                            average_period_count <= 7'd0;
                         end
                     end else begin
                         valid_edges <= 3'd0;
                         locked <= 1'b0;
                         jump_candidate_valid <= 1'b0;
+                        average_period_q8 <= 32'd0;
+                        average_period_sum <= 23'd0;
+                        average_period_count <= 7'd0;
                     end
 
                     period_counter <= 32'd0;
