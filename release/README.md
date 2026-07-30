@@ -3,6 +3,10 @@
 These files archive the hardware images used with the remapped Tang Primer
 25K ADDA interface.
 
+Release status: **V1 (questions 1-4 stable)**. The Raspberry Pi vision path
+for question 5 remains an integration interface and is not part of the V1
+stability claim.
+
 ## FPGA
 
 - `f2026_fpga_20260730.fs`: GW5A-25A bitstream with the remapped ADDA pins,
