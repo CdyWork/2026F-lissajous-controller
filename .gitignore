@@ -1,0 +1,22 @@
+# IDE and local settings
+.vscode/
+.idea/
+
+# Gowin, ModelSim and CMake generated state
+**/impl/
+**/build/
+**/work/
+**/transcript
+*.log
+*.tmp
+
+# Python caches and local captures
+**/__pycache__/
+*.py[cod]
+pi/captures/
+q5_sawtooth_vision_sim/outputs/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+

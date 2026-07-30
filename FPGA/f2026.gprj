@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE gowin-fpga-project>
+<Project>
+    <Template>FPGA</Template>
+    <Version>5</Version>
+    <Device name="GW5A-25A" pn="GW5A-LV25MG121NC1/I0">gw5a25a-002</Device>
+    <FileList>
+        <File path="rtl/reset_conditioner.v" type="file.verilog" enable="1"/>
+        <File path="rtl/spi_mode0_slave.v" type="file.verilog" enable="1"/>
+        <File path="rtl/f2026_input_tracker.v" type="file.verilog" enable="1"/>
+        <File path="rtl/f2026_phase_increment.v" type="file.verilog" enable="1"/>
+        <File path="rtl/f2026_waveform_core.v" type="file.verilog" enable="1"/>
+        <File path="rtl/f2026_spi_control.v" type="file.verilog" enable="1"/>
+        <File path="rtl/f2026_top.v" type="file.verilog" enable="1"/>
+        <File path="constraints/tang_primer_25k_f2026.cst" type="file.cst" enable="1"/>
+        <File path="constraints/tang_primer_25k_f2026.sdc" type="file.sdc" enable="1"/>
+    </FileList>
+</Project>
