@@ -131,7 +131,8 @@ module f2026_top (
                low_frequency_phase_calibration +
                tracking_latency_phase));
     assign output_active = output_enable && (mode != 3'd0) &&
-        (free_run ? (phase_increment != 32'd0) : tracked_output_qualified);
+        (free_run ? ((mode == 3'd5) || (phase_increment != 32'd0))
+                  : tracked_output_qualified);
 
     always @(posedge clk_50m) begin
         if (!reset_n || free_run || !output_enable || (mode == 3'd0)) begin

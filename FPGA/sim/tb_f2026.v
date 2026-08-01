@@ -55,6 +55,10 @@ module tb_f2026;
         .uart_tx(uart_tx)
     );
 
+    // Keep this regression short while preserving the production 400 ms
+    // dwell in synthesis (the core's default parameter is 75 frames).
+    defparam dut.waveform_inst.PROBE_SWEEP_FRAMES_PER_STEP = 8'd2;
+
     task check;
         input condition;
         input [8*96-1:0] message;
@@ -274,7 +278,7 @@ module tb_f2026;
         read_status;
         check(rx_frame[3][0] == 1'b0, "missing input clears lock");
         check(rx_frame[3][2] == 1'b0, "missing input mutes tracked output");
-        check(da_data == 8'h80, "loss of lock returns DAC to midpoint");
+        check(da_data == 8'hFF, "loss of lock parks DAC at the negative endpoint");
         source_enable = 1'b1;
         #600000;
         read_status;
@@ -289,12 +293,12 @@ module tb_f2026;
 
         write_control(3'd1, 8'd26, 8'h03, 32'd1717987, 32'd0);
         #100000;
-        measure_span(3000, minimum_code, maximum_code);
+        measure_span(12000, minimum_code, maximum_code);
         check((maximum_code - minimum_code) >= 48, "free-run Raspberry Pi path");
 
         write_control(3'd0, 8'd0, 8'h00, 32'd0, 32'd0);
         #10000;
-        check(da_data == 8'h80, "disabled DAC returns to midpoint");
+        check(da_data == 8'hFF, "idle DAC parks at the negative endpoint");
 
         fpga_reset_n = 1'b0;
         source_hz = 100000;
@@ -342,6 +346,35 @@ module tb_f2026;
               "1 kHz boundary period");
         check((rx_frame[12] < 8'd90) && (rx_frame[13] > 8'd166),
               "ADC statistics cover input span");
+
+        // Q5 probe: a rising sawtooth repeats in a 2 ms frame.
+        write_control(3'd4, 8'd0, 8'h03, 32'd2500, 32'd100000);
+        measure_span(12000, minimum_code, maximum_code);
+        check(minimum_code <= 1, "rising probe reaches the positive endpoint");
+        check(maximum_code == 255, "rising probe begins at the negative endpoint");
+        #1800000;
+        check(dut.waveform_inst.probe_frame_counter < 32'd5000,
+              "rising probe wraps on the 2 ms frame period");
+        measure_span(12000, minimum_code, maximum_code);
+        check(maximum_code == 255, "rising probe returns to the negative endpoint");
+
+        // FPGA-owned Q5 sweep: each setting changes only after its full
+        // cyclic frame, so a sawtooth cannot be cut in the middle.
+        write_control(3'd5, 8'd0, 8'h03, 32'd500, 32'd100000);
+        #1000;
+        check(dut.waveform_inst.probe_sweep_index == 3'd0,
+              "sweep starts at the 10 us setting");
+        #4000000;
+        check(dut.waveform_inst.probe_sweep_index == 3'd1,
+              "sweep advances after the configured full-frame dwell");
+        check(dut.waveform_inst.probe_frame_counter < 32'd1000,
+              "sweep setting transition occurs on a frame boundary");
+        #28000000;
+        check(dut.waveform_inst.probe_sweep_index == 3'd0,
+              "sweep wraps after all eight settings");
+        check(da_data == 8'hFF || dut.waveform_inst.probe_frame_counter <
+              dut.waveform_inst.probe_ramp_ticks,
+              "sweep parks DAC at the negative endpoint outside the ramp");
 
         if (errors == 0) begin
             $display("MODELSIM_RESULT: PASS");

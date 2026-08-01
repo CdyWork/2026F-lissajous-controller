@@ -27,6 +27,7 @@ target_sources(${PROJECT_NAME} PRIVATE
     ${PROJECT_ROOT}/Src/f2026_app.c
     ${PROJECT_ROOT}/Src/f2026_fpga.c
     ${PROJECT_ROOT}/Src/f2026_pi.c
+    ${PROJECT_ROOT}/Src/ad9833.c
     ${PROJECT_ROOT}/Src/bsp_board.c
     ${PROJECT_ROOT}/Src/bsp_clock.c
     ${PROJECT_ROOT}/Src/bsp_dma.c

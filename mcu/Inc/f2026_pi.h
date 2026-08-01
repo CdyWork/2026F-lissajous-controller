@@ -15,7 +15,12 @@ typedef enum {
     F2026_PI_COMMAND_AMPLITUDE,
     F2026_PI_COMMAND_FREQUENCY,
     F2026_PI_COMMAND_PHASE,
-    F2026_PI_COMMAND_CALIBRATE
+    F2026_PI_COMMAND_CALIBRATE,
+    F2026_PI_COMMAND_PROBE,
+    F2026_PI_COMMAND_STEP,
+    F2026_PI_COMMAND_SWEEP,
+    F2026_PI_COMMAND_IDLE,
+    F2026_PI_COMMAND_RESULT
 } F2026_PiCommandType;
 
 typedef struct {
@@ -28,5 +33,6 @@ typedef struct {
 void F2026_PiInit(void);
 bool F2026_PiPoll(F2026_PiCommand *command);
 void F2026_PiReply(const char *text);
+void F2026_PiNotifyMeasureRequest(void);
 
 #endif

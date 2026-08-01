@@ -1,25 +1,5 @@
-# Verified hardware images
+# 发布镜像
 
-These files archive the hardware images used with the remapped Tang Primer
-25K ADDA interface.
+此目录保存已验证的 FPGA 与 STM32 镜像。当前第五问的定版工作流、重新构建和下载要求以仓库根目录 [README](../README.md) 为准。
 
-Release status: **V1 (questions 1-4 stable)**. The Raspberry Pi vision path
-for question 5 remains an integration interface and is not part of the V1
-stability claim.
-
-## FPGA
-
-- `f2026_fpga_20260730.fs`: GW5A-25A bitstream with the remapped ADDA pins,
-  5 ms lock holdover, fast large-step reacquisition, 1 kHz detection margin,
-  and measured phase calibration.
-- Build source: `FPGA/`.
-- Programming target: SRAM for validation; external Flash only after final
-  oscilloscope acceptance.
-
-## STM32
-
-- `f2026_controller_f407_20260729.bin`: raw STM32F407 firmware image.
-- `f2026_controller_f407_20260729.hex`: Intel HEX version of the same build.
-- Build source: `mcu/`.
-
-SHA-256 hashes are recorded in `SHA256SUMS.txt`.
+镜像写入 Flash 前必须先以当前 IMX219 视觉测频流程完成 SRAM/台架验证。
