@@ -27,11 +27,11 @@ target_sources(${PROJECT_NAME} PRIVATE
     ${PROJECT_ROOT}/Src/f2026_app.c
     ${PROJECT_ROOT}/Src/f2026_fpga.c
     ${PROJECT_ROOT}/Src/f2026_pi.c
-    ${PROJECT_ROOT}/Src/ad9833.c
     ${PROJECT_ROOT}/Src/bsp_board.c
     ${PROJECT_ROOT}/Src/bsp_clock.c
     ${PROJECT_ROOT}/Src/bsp_dma.c
     ${PROJECT_ROOT}/Src/bsp_error.c
+    ${PROJECT_ROOT}/Src/bsp_keypad.c
     ${PROJECT_ROOT}/Src/bsp_lcd.c
     ${PROJECT_ROOT}/Src/bsp_lcd_font.c
     ${PROJECT_ROOT}/Src/bsp_rs485.c

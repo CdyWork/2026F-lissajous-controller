@@ -1,8 +1,8 @@
 `timescale 1ns / 1ps
 
 module f2026_waveform_core #(
-    // 200 cyclic 2 ms frames = 400 ms for each visual sweep setting.
-    parameter [7:0] PROBE_SWEEP_FRAMES_PER_STEP = 8'd200
+    // 40 cyclic 10 ms frames = 400 ms for each visual sweep setting.
+    parameter [7:0] PROBE_SWEEP_FRAMES_PER_STEP = 8'd40
 ) (
     input  wire        clk,
     input  wire        reset_n,
@@ -25,7 +25,7 @@ module f2026_waveform_core #(
     localparam [2:0] MODE_PROBE    = 3'd4;
     localparam [2:0] MODE_PROBE_SWEEP = 3'd5;
     localparam [2:0] MODE_PROBE_TABLE = 3'd6;
-    localparam [31:0] PROBE_SWEEP_FRAME_TICKS = 32'd100000;
+    localparam [31:0] PROBE_SWEEP_FRAME_TICKS = 32'd500000;
     // The ADDA DAC transfer characteristic is inverted on this bench.
     // The DAC transfer is inverted: 8'hFF is the physical negative endpoint
     // and 8'h00 is the positive endpoint. Park at the negative endpoint.
@@ -63,7 +63,7 @@ module f2026_waveform_core #(
 
     // Log-spaced 10 us..1000 us table plus two low-frequency fallbacks.
     // Index 32 uses a 2 ms ramp and index 33 a 6 ms ramp; both use 10 ms
-    // frames. All other entries use 2 ms frames.
+    // frames. All other entries use 10 ms frames.
     function [31:0] probe_table_ramp_ticks;
         input [5:0] index;
         begin

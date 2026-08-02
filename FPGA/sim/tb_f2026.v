@@ -56,8 +56,9 @@ module tb_f2026;
     );
 
     // Keep this regression short while preserving the production 400 ms
-    // dwell in synthesis (the core's default parameter is 75 frames).
+    // dwell in synthesis (the core's default parameter is 40 frames).
     defparam dut.waveform_inst.PROBE_SWEEP_FRAMES_PER_STEP = 8'd2;
+    defparam dut.tracker_inst.CALIBRATION_PERIODS = 32'd16;
 
     task check;
         input condition;
@@ -179,7 +180,7 @@ module tb_f2026;
 
         read_status;
         check(rx_frame[1] == 8'hF6, "SPI status signature");
-        check(rx_frame[2] == 8'h02, "SPI protocol version");
+        check(rx_frame[2] == 8'h03, "SPI protocol version");
         check(rx_frame[3][0] == 1'b1, "input tracker locked");
         check(({rx_frame[7], rx_frame[6], rx_frame[5], rx_frame[4]} > 32'd4950) &&
               ({rx_frame[7], rx_frame[6], rx_frame[5], rx_frame[4]} < 32'd5050),
@@ -296,6 +297,43 @@ module tb_f2026;
         measure_span(12000, minimum_code, maximum_code);
         check((maximum_code - minimum_code) >= 48, "free-run Raspberry Pi path");
 
+        // A Q5 PHASEQ command only changes phase_offset while free-run
+        // frequency remains unchanged. Verify both the SPI register and the
+        // physical DAC quadrants so a stale or ignored phase word cannot pass
+        // this regression unnoticed. Increment 1 keeps the base phase nearly
+        // stationary during the four SPI frames.
+        write_control(3'd0, 8'd0, 8'h00, 32'd0, 32'd0);
+        write_control(3'd1, 8'd51, 8'h03, 32'd1, 32'h0000_0000);
+        #1000;
+        check(dut.phase_offset == 32'h0000_0000,
+              "free-run phase register accepts 0 degrees");
+        check((da_data >= 8'd126) && (da_data <= 8'd130),
+              "free-run 0 degree DAC is at midpoint");
+
+        write_control(3'd0, 8'd0, 8'h00, 32'd0, 32'd0);
+        write_control(3'd1, 8'd51, 8'h03, 32'd1, 32'h4000_0000);
+        #1000;
+        check(dut.phase_offset == 32'h4000_0000,
+              "free-run phase register accepts 90 degrees");
+        check((da_data >= 8'd75) && (da_data <= 8'd81),
+              "free-run 90 degree DAC reaches positive peak");
+
+        write_control(3'd0, 8'd0, 8'h00, 32'd0, 32'd0);
+        write_control(3'd1, 8'd51, 8'h03, 32'd1, 32'h8000_0000);
+        #1000;
+        check(dut.phase_offset == 32'h8000_0000,
+              "free-run phase register accepts 180 degrees");
+        check((da_data >= 8'd126) && (da_data <= 8'd130),
+              "free-run 180 degree DAC returns to midpoint");
+
+        write_control(3'd0, 8'd0, 8'h00, 32'd0, 32'd0);
+        write_control(3'd1, 8'd51, 8'h03, 32'd1, 32'hC000_0000);
+        #1000;
+        check(dut.phase_offset == 32'hC000_0000,
+              "free-run phase register accepts 270 degrees");
+        check((da_data >= 8'd175) && (da_data <= 8'd181),
+              "free-run 270 degree DAC reaches negative peak");
+
         write_control(3'd0, 8'd0, 8'h00, 32'd0, 32'd0);
         #10000;
         check(da_data == 8'hFF, "idle DAC parks at the negative endpoint");
@@ -313,6 +351,17 @@ module tb_f2026;
               "100 kHz boundary period");
         check(dut.low_frequency_phase_calibration == 32'd0,
               "high frequency bypasses low-frequency phase fit");
+
+        // Shortened to 16 input periods by the testbench defparam. Production
+        // uses 50,000 periods for a half-second reference calibration.
+        write_control(3'd1, 8'd13, 8'h07, 32'd8589935, 32'd0);
+        #300000;
+        read_status;
+        check(rx_frame[3][4] == 1'b1, "reference calibration completes");
+        check(({rx_frame[11], rx_frame[10], rx_frame[9], rx_frame[8]} >= 32'd7900) &&
+              ({rx_frame[11], rx_frame[10], rx_frame[9], rx_frame[8]} <= 32'd8100),
+              "reference calibration returns 16 periods");
+        write_control(3'd1, 8'd13, 8'h03, 32'd8589935, 32'd0);
 
         // A full-range frequency step must not wait for the old IIR state to
         // converge over dozens of slow input periods.
@@ -347,29 +396,29 @@ module tb_f2026;
         check((rx_frame[12] < 8'd90) && (rx_frame[13] > 8'd166),
               "ADC statistics cover input span");
 
-        // Q5 probe: a rising sawtooth repeats in a 2 ms frame.
-        write_control(3'd4, 8'd0, 8'h03, 32'd2500, 32'd100000);
+        // Q5 probe: a rising sawtooth repeats in a 10 ms frame.
+        write_control(3'd4, 8'd0, 8'h03, 32'd2500, 32'd500000);
         measure_span(12000, minimum_code, maximum_code);
         check(minimum_code <= 1, "rising probe reaches the positive endpoint");
         check(maximum_code == 255, "rising probe begins at the negative endpoint");
-        #1800000;
+        #9800000;
         check(dut.waveform_inst.probe_frame_counter < 32'd5000,
-              "rising probe wraps on the 2 ms frame period");
+              "rising probe wraps on the 10 ms frame period");
         measure_span(12000, minimum_code, maximum_code);
         check(maximum_code == 255, "rising probe returns to the negative endpoint");
 
         // FPGA-owned Q5 sweep: each setting changes only after its full
         // cyclic frame, so a sawtooth cannot be cut in the middle.
-        write_control(3'd5, 8'd0, 8'h03, 32'd500, 32'd100000);
+        write_control(3'd5, 8'd0, 8'h03, 32'd500, 32'd500000);
         #1000;
         check(dut.waveform_inst.probe_sweep_index == 3'd0,
               "sweep starts at the 10 us setting");
-        #4000000;
+        #20000000;
         check(dut.waveform_inst.probe_sweep_index == 3'd1,
               "sweep advances after the configured full-frame dwell");
         check(dut.waveform_inst.probe_frame_counter < 32'd1000,
               "sweep setting transition occurs on a frame boundary");
-        #28000000;
+        #140000000;
         check(dut.waveform_inst.probe_sweep_index == 3'd0,
               "sweep wraps after all eight settings");
         check(da_data == 8'hFF || dut.waveform_inst.probe_frame_counter <

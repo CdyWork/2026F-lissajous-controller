@@ -86,8 +86,10 @@ bool F2026_FpgaReadStatus(F2026_FpgaStatus *status)
     status->otr_seen = (flags & 0x02U) != 0U;
     status->output_enabled = (flags & 0x04U) != 0U;
     status->free_run = (flags & 0x08U) != 0U;
+    status->calibration_done = (flags & 0x10U) != 0U;
     status->period_ticks = unpack_u32_le(&rx[4]);
     status->edge_count = unpack_u32_le(&rx[8]);
+    status->calibration_ticks = status->edge_count;
     status->sample_min = rx[12];
     status->sample_max = rx[13];
     status->mode = (F2026_FpgaMode)(rx[14] & 0x07U);
@@ -108,7 +110,8 @@ bool F2026_FpgaWriteControl(const F2026_FpgaControl *control)
     tx[1] = (uint8_t)control->mode;
     tx[2] = control->amplitude_code;
     tx[3] = (control->output_enable ? 0x01U : 0U) |
-            (control->free_run ? 0x02U : 0U);
+            (control->free_run ? 0x02U : 0U) |
+            (control->calibration_start ? 0x04U : 0U);
     pack_u32_le(&tx[4], control->phase_increment);
     pack_u32_le(&tx[8], control->phase_offset);
     tx[12] = control->dac_mid;

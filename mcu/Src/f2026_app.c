@@ -3,10 +3,9 @@
 #include "f2026_fpga.h"
 #include "f2026_pi.h"
 
-#include "ad9833.h"
-
 #include "bsp_board.h"
 #include "bsp_dma.h"
+#include "bsp_keypad.h"
 #include "bsp_lcd.h"
 #include "main.h"
 
@@ -19,21 +18,26 @@
 
 #define F2026_TASK_STACK_WORDS 768U
 #define F2026_TASK_PRIORITY (tskIDLE_PRIORITY + 2U)
-#define F2026_AD9833_TASK_STACK_WORDS 192U
-#define F2026_AD9833_TASK_PRIORITY (tskIDLE_PRIORITY + 1U)
-#define F2026_AD9833_OUTPUT_HZ 4000U
-#define F2026_AD9833_WRITE_PERIOD_MS 16U
+#define F2026_Q5_FREQUENCY_1_HZ 1100U
+#define F2026_Q5_FREQUENCY_2_HZ 49900U
+#define F2026_Q5_FREQUENCY_3_HZ 90900U
+#define F2026_REFERENCE_CALIBRATION_HZ 100000U
+#define F2026_REFERENCE_CALIBRATION_PERIODS 50000ULL
+#define F2026_REFERENCE_CALIBRATION_EXPECTED_TICKS \
+    (F2026_REFERENCE_CALIBRATION_PERIODS * \
+     (50000000ULL / F2026_REFERENCE_CALIBRATION_HZ))
+#define F2026_REFERENCE_CALIBRATION_TIMEOUT_MS 3000U
 #define F2026_DEFAULT_PHASE_DEGREES 14U
 #define F2026_DEFAULT_PHASE_WORD 0x09F49F49U
-#define F2026_PROBE_DEFAULT_FRAME_US 2000U
+#define F2026_PROBE_DEFAULT_FRAME_US 10000U
 #define F2026_PROBE_DEFAULT_RAMP_US 50U
 #define F2026_PROBE_MIN_RAMP_US 10U
 #define F2026_PROBE_MAX_RAMP_US 1800U
 #define F2026_PROBE_FRAME_QUANTUM_US 200U
 #define F2026_PROBE_MIN_FRAME_US F2026_PROBE_FRAME_QUANTUM_US
-#define F2026_PROBE_MAX_FRAME_US 2000U
+#define F2026_PROBE_MAX_FRAME_US 10000U
 #define F2026_FPGA_TICKS_PER_US 50U
-#define F2026_PROBE_SWEEP_FRAME_US 2000U
+#define F2026_PROBE_SWEEP_FRAME_US 10000U
 #define F2026_PROBE_SWEEP_FIRST_RAMP_US 10U
 #define F2026_PROBE_TABLE_MID_INDEX 16U
 #define F2026_VISION_MEASUREMENT_TIMEOUT_MS 12000U
@@ -55,6 +59,13 @@ typedef struct {
     bool vision_frequency_valid;
     bool vision_measurement_pending;
     uint32_t vision_measurement_started_ms;
+    bool reference_calibration_pending;
+    bool reference_calibration_started;
+    bool reference_calibration_start_request;
+    bool reference_calibration_valid;
+    bool reference_calibration_failed;
+    uint32_t reference_calibration_ticks;
+    uint32_t reference_calibration_started_ms;
 } F2026_State;
 
 static const uint8_t amplitude_divisions[4] = {2U, 4U, 6U, 8U};
@@ -73,19 +84,28 @@ static F2026_State state = {
     .vision_frequency_hz = 0U,
     .vision_frequency_valid = false,
     .vision_measurement_pending = false,
-    .vision_measurement_started_ms = 0U
+    .vision_measurement_started_ms = 0U,
+    .reference_calibration_pending = false,
+    .reference_calibration_started = false,
+    .reference_calibration_start_request = false,
+    .reference_calibration_valid = false,
+    .reference_calibration_failed = false,
+    .reference_calibration_ticks = 0U,
+    .reference_calibration_started_ms = 0U
 };
 
 static void F2026_Task(void *argument);
-static void F2026_AD9833WriteTask(void *argument);
 static void F2026_HardwareInit(void);
 static void F2026_ApplyControl(void);
 static void F2026_ServiceKeys(void);
+static void F2026_StartVisionTask(uint8_t task_number);
 static void F2026_ServicePi(void);
 static void F2026_DrawStatus(void);
 static void F2026_SendPiStatus(void);
 static const char *F2026_ModeName(F2026_FpgaMode mode);
 static int F2026_AmplitudeIndex(uint32_t divisions);
+static bool F2026_IsQ5Frequency(uint32_t frequency_hz);
+static uint32_t F2026_OutputPhaseIncrement(uint32_t frequency_hz);
 
 void F2026_AppStart(void)
 {
@@ -102,15 +122,6 @@ void F2026_AppStart(void)
         Error_Handler();
     }
 
-    if (xTaskCreate(F2026_AD9833WriteTask,
-                    "ad9833",
-                    F2026_AD9833_TASK_STACK_WORDS,
-                    0,
-                    F2026_AD9833_TASK_PRIORITY,
-                    0) != pdPASS) {
-        Error_Handler();
-    }
-
     vTaskStartScheduler();
     Error_Handler();
 }
@@ -118,10 +129,8 @@ void F2026_AppStart(void)
 static void F2026_HardwareInit(void)
 {
     BSP_Board_Init();
+    BSP_Keypad_Init();
     BSP_DMA_Init();
-
-    AD9833_Init();
-    AD9833_SetFrequency(F2026_AD9833_OUTPUT_HZ);
 
     F2026_FpgaInterfaceInit();
     F2026_PiInit();
@@ -150,6 +159,19 @@ static void F2026_Task(void *argument)
             state.communication_ok = true;
             state.output_active = latest_status.output_enabled;
 
+            if (state.reference_calibration_pending &&
+                state.reference_calibration_started &&
+                latest_status.calibration_done) {
+                state.reference_calibration_pending = false;
+                state.reference_calibration_ticks = latest_status.calibration_ticks;
+                state.reference_calibration_valid =
+                    (latest_status.calibration_ticks >= 24000000U) &&
+                    (latest_status.calibration_ticks <= 26000000U);
+                state.reference_calibration_failed =
+                    !state.reference_calibration_valid;
+                state.last_control_valid = false;
+            }
+
             if (state.last_control_valid &&
                 ((latest_status.mode != state.last_control.mode) ||
                  (latest_status.amplitude_code != state.last_control.amplitude_code) ||
@@ -174,18 +196,6 @@ static void F2026_Task(void *argument)
     }
 }
 
-static void F2026_AD9833WriteTask(void *argument)
-{
-    TickType_t last_wake = xTaskGetTickCount();
-
-    (void)argument;
-
-    for (;;) {
-        AD9833_Refresh();
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(F2026_AD9833_WRITE_PERIOD_MS));
-    }
-}
-
 static void F2026_ApplyControl(void)
 {
     F2026_FpgaControl control;
@@ -196,6 +206,7 @@ static void F2026_ApplyControl(void)
     control.phase_offset = state.user_phase_word;
     control.dac_mid = 0x80U;
     control.threshold_hysteresis = 3U;
+    control.calibration_start = state.reference_calibration_start_request;
 
     if (state.mode != F2026_FPGA_MODE_IDLE) {
         if (state.mode == F2026_FPGA_MODE_PROBE) {
@@ -205,7 +216,7 @@ static void F2026_ApplyControl(void)
             control.output_enable = true;
         } else if (state.mode == F2026_FPGA_MODE_PROBE_SWEEP) {
             // The FPGA owns all eight ramp widths and switches only at the
-            // 2 ms frame boundary. These values merely arm the free-run path.
+            // 10 ms frame boundary. These values merely arm the free-run path.
             control.free_run = true;
             control.phase_increment =
                 F2026_PROBE_SWEEP_FIRST_RAMP_US * F2026_FPGA_TICKS_PER_US;
@@ -214,7 +225,7 @@ static void F2026_ApplyControl(void)
             control.output_enable = true;
         } else if (state.mode == F2026_FPGA_MODE_PROBE_TABLE) {
             // phase_increment carries the 0..31 table index. The FPGA latches
-            // it on the next 2 ms frame boundary.
+            // it on the next 10 ms frame boundary.
             control.free_run = true;
             control.phase_increment = state.probe_ramp_us;
             control.phase_offset =
@@ -222,7 +233,7 @@ static void F2026_ApplyControl(void)
             control.output_enable = true;
         } else if (state.free_run) {
             control.phase_increment =
-                F2026_PhaseIncrementFromHz(state.free_frequency_hz);
+                F2026_OutputPhaseIncrement(state.free_frequency_hz);
             control.output_enable = control.phase_increment != 0U;
         } else {
             // Tracking frequency, phase correction and loss-of-lock muting are
@@ -236,6 +247,10 @@ static void F2026_ApplyControl(void)
         if (F2026_FpgaWriteControl(&control)) {
             state.last_control = control;
             state.last_control_valid = true;
+            if (state.reference_calibration_start_request) {
+                state.reference_calibration_start_request = false;
+                state.reference_calibration_started = true;
+            }
         } else {
             state.communication_ok = false;
             state.output_active = false;
@@ -246,6 +261,7 @@ static void F2026_ApplyControl(void)
 static void F2026_ServiceKeys(void)
 {
     uint16_t event = BSP_Key_Scan();
+    char matrix_key = BSP_Keypad_Scan();
 
     if (state.vision_measurement_pending &&
         ((uint32_t)(HAL_GetTick() - state.vision_measurement_started_ms) >=
@@ -261,26 +277,62 @@ static void F2026_ServiceKeys(void)
         state.mode = F2026_FPGA_MODE_CIRCLE;
         state.free_run = false;
     }
-    if ((event & BSP_KEY2_PRESS) != 0U) {
-        state.mode = F2026_FPGA_MODE_DOUBLE;
-        state.free_run = false;
-    }
-    if (((event & BSP_KEY3_PRESS) != 0U) && !state.vision_measurement_pending) {
+    if (((event & BSP_KEY2_PRESS) != 0U) && !state.reference_calibration_pending) {
         state.vision_frequency_hz = 0U;
         state.vision_frequency_valid = false;
-        state.vision_measurement_pending = true;
-        state.vision_measurement_started_ms = HAL_GetTick();
-        F2026_PiNotifyMeasureRequest();
+        state.vision_measurement_pending = false;
+        state.mode = F2026_FPGA_MODE_DIAGONAL;
+        state.free_run = true;
+        state.free_frequency_hz = F2026_REFERENCE_CALIBRATION_HZ;
+        state.reference_calibration_pending = true;
+        state.reference_calibration_started = false;
+        state.reference_calibration_start_request = true;
+        state.reference_calibration_valid = false;
+        state.reference_calibration_failed = false;
+        state.reference_calibration_ticks = 0U;
+        state.reference_calibration_started_ms = HAL_GetTick();
+        state.last_control_valid = false;
     }
 
-    // KEY3 delegates all FPGA transitions to the Orange Pi. Re-applying an
-    // MCU control word here can race its first IDLE/STEP command.
-    if ((event & (uint16_t)~BSP_KEY3_PRESS) != BSP_KEY_EVENT_NONE) {
+    if (((event & BSP_KEY3_PRESS) != 0U) &&
+        !state.vision_measurement_pending) {
+        F2026_StartVisionTask(1U);
+    }
+
+    if ((matrix_key >= '1') && (matrix_key <= '3')) {
+        F2026_StartVisionTask((uint8_t)(matrix_key - '0'));
+    }
+
+    if (state.reference_calibration_pending &&
+        ((uint32_t)(HAL_GetTick() - state.reference_calibration_started_ms) >=
+         F2026_REFERENCE_CALIBRATION_TIMEOUT_MS)) {
+        state.reference_calibration_pending = false;
+        state.reference_calibration_start_request = false;
+        state.reference_calibration_failed = true;
+    }
+
+    if (((event & (uint16_t)~BSP_KEY3_PRESS) != BSP_KEY_EVENT_NONE) ||
+        ((matrix_key >= '1') && (matrix_key <= '3'))) {
         BSP_Beep_Write(true);
         vTaskDelay(pdMS_TO_TICKS(15U));
         BSP_Beep_Write(false);
         state.last_control_valid = false;
     }
+}
+
+static void F2026_StartVisionTask(uint8_t task_number)
+{
+    if ((task_number < 1U) || (task_number > 3U) ||
+        state.vision_measurement_pending ||
+        state.reference_calibration_pending) {
+        return;
+    }
+
+    state.vision_frequency_hz = 0U;
+    state.vision_frequency_valid = false;
+    state.vision_measurement_pending = true;
+    state.vision_measurement_started_ms = HAL_GetTick();
+    F2026_PiNotifyMeasureRequest(task_number);
 }
 
 static void F2026_ServicePi(void)
@@ -333,7 +385,22 @@ static void F2026_ServicePi(void)
             break;
         case F2026_PI_COMMAND_PHASE:
             state.user_phase_word = F2026_PhaseWordFromDegrees(command.value);
+            // The Pi captures immediately after the command reply.  Apply the
+            // phase word before acknowledging it so that reply is a real
+            // hardware boundary rather than a queued MCU request.
+            state.last_control_valid = false;
+            F2026_ApplyControl();
             F2026_PiReply("OK PHASE\r\n");
+            break;
+        case F2026_PI_COMMAND_PHASE_FINE:
+            if (command.value < 360000U) {
+                state.user_phase_word = (uint32_t)((((uint64_t)command.value) << 32U) / 360000ULL);
+                state.last_control_valid = false;
+                F2026_ApplyControl();
+                F2026_PiReply("OK PHASEQ\r\n");
+            } else {
+                F2026_PiReply("ERR PHASEQ\r\n");
+            }
             break;
         case F2026_PI_COMMAND_CALIBRATE:
             amplitude_index = F2026_AmplitudeIndex(command.value);
@@ -391,10 +458,28 @@ static void F2026_ServicePi(void)
             F2026_PiReply("OK SWEEP\r\n");
             break;
         case F2026_PI_COMMAND_RESULT:
-            state.vision_frequency_hz = command.value;
-            state.vision_frequency_valid = command.value != 0U;
-            state.vision_measurement_pending = false;
-            F2026_PiReply("OK RESULT\r\n");
+            if (F2026_IsQ5Frequency(command.value)) {
+                state.vision_frequency_hz = command.value;
+                state.vision_frequency_valid = true;
+                state.vision_measurement_pending = false;
+                state.mode = F2026_FPGA_MODE_DIAGONAL;
+                state.free_run = true;
+                state.free_frequency_hz = command.value;
+                state.last_control_valid = false;
+                F2026_ApplyControl();
+                F2026_PiReply("OK RESULT\r\n");
+            } else if (command.value == 0U) {
+                state.vision_frequency_hz = 0U;
+                state.vision_frequency_valid = false;
+                state.vision_measurement_pending = false;
+                state.mode = F2026_FPGA_MODE_IDLE;
+                state.free_run = false;
+                state.last_control_valid = false;
+                F2026_ApplyControl();
+                F2026_PiReply("OK RESULT\r\n");
+            } else {
+                F2026_PiReply("ERR RESULT\r\n");
+            }
             break;
         default:
             F2026_PiReply("ERR COMMAND\r\n");
@@ -462,10 +547,27 @@ static void F2026_DrawStatus(void)
                        state.fpga_status.otr_seen ? BSP_LCD_RED : BSP_LCD_GREEN,
                        BSP_LCD_BLACK);
 
-    BSP_LCD_ShowString(0U, 84U, "ADC", BSP_LCD_CYAN, BSP_LCD_BLACK);
-    BSP_LCD_ShowU32(40U, 84U, state.fpga_status.sample_min, BSP_LCD_WHITE, BSP_LCD_BLACK);
-    BSP_LCD_ShowString(72U, 84U, "-", BSP_LCD_GRAY, BSP_LCD_BLACK);
-    BSP_LCD_ShowU32(88U, 84U, state.fpga_status.sample_max, BSP_LCD_WHITE, BSP_LCD_BLACK);
+    if (state.reference_calibration_pending ||
+        state.reference_calibration_valid ||
+        state.reference_calibration_failed) {
+        BSP_LCD_ShowString(0U, 84U, "CAL", BSP_LCD_CYAN, BSP_LCD_BLACK);
+        BSP_LCD_ShowString(40U, 84U,
+                           state.reference_calibration_pending ? "RUN" :
+                           state.reference_calibration_valid ? "OK" : "FAIL",
+                           state.reference_calibration_pending ? BSP_LCD_YELLOW :
+                           state.reference_calibration_valid ? BSP_LCD_GREEN : BSP_LCD_RED,
+                           BSP_LCD_BLACK);
+        if (state.reference_calibration_valid) {
+            BSP_LCD_ShowString(72U, 84U, "T", BSP_LCD_GRAY, BSP_LCD_BLACK);
+            BSP_LCD_ShowU32(80U, 84U, state.reference_calibration_ticks,
+                            BSP_LCD_WHITE, BSP_LCD_BLACK);
+        }
+    } else {
+        BSP_LCD_ShowString(0U, 84U, "ADC", BSP_LCD_CYAN, BSP_LCD_BLACK);
+        BSP_LCD_ShowU32(40U, 84U, state.fpga_status.sample_min, BSP_LCD_WHITE, BSP_LCD_BLACK);
+        BSP_LCD_ShowString(72U, 84U, "-", BSP_LCD_GRAY, BSP_LCD_BLACK);
+        BSP_LCD_ShowU32(88U, 84U, state.fpga_status.sample_max, BSP_LCD_WHITE, BSP_LCD_BLACK);
+    }
 
     BSP_LCD_ShowString(0U, 100U, "FPGA", BSP_LCD_CYAN, BSP_LCD_BLACK);
     BSP_LCD_ShowString(48U, 100U,
@@ -477,7 +579,7 @@ static void F2026_DrawStatus(void)
                        state.output_active ? BSP_LCD_GREEN : BSP_LCD_YELLOW,
                        BSP_LCD_BLACK);
 
-    BSP_LCD_ShowString(0U, 116U, "0:1X 1:90 2:2X 3:MEAS", BSP_LCD_GRAY, BSP_LCD_BLACK);
+    BSP_LCD_ShowString(0U, 116U, "KP1:0 KP2:90 KP3:2X", BSP_LCD_GRAY, BSP_LCD_BLACK);
 }
 
 static void F2026_SendPiStatus(void)
@@ -492,7 +594,7 @@ static void F2026_SendPiStatus(void)
 
     (void)snprintf(response,
                    sizeof(response),
-                   "STATUS MODE=%s AUTO=%u AMP=%u FREQ=%lu RAMP_US=%lu FRAME_US=%lu LOCK=%u ADC=%u,%u OTR=%u OUTPUT=%u COMM=%u FOUT=%u VER=%u\r\n",
+                   "STATUS MODE=%s AUTO=%u AMP=%u FREQ=%lu RAMP_US=%lu FRAME_US=%lu LOCK=%u ADC=%u,%u OTR=%u OUTPUT=%u COMM=%u FOUT=%u CAL=%u CTICKS=%lu VER=%u\r\n",
                    F2026_ModeName(state.mode),
                    state.free_run ? 1U : 0U,
                    amplitude_divisions[state.amplitude_index],
@@ -506,6 +608,8 @@ static void F2026_SendPiStatus(void)
                    state.output_active ? 1U : 0U,
                    state.communication_ok ? 1U : 0U,
                    state.fpga_status.output_enabled ? 1U : 0U,
+                   state.fpga_status.calibration_done ? 1U : 0U,
+                   (unsigned long)state.fpga_status.calibration_ticks,
                    state.fpga_status.protocol_version);
     F2026_PiReply(response);
 }
@@ -538,6 +642,27 @@ static int F2026_AmplitudeIndex(uint32_t divisions)
             return (int)i;
     }
     return -1;
+}
+
+static bool F2026_IsQ5Frequency(uint32_t frequency_hz)
+{
+    return (frequency_hz == F2026_Q5_FREQUENCY_1_HZ) ||
+           (frequency_hz == F2026_Q5_FREQUENCY_2_HZ) ||
+           (frequency_hz == F2026_Q5_FREQUENCY_3_HZ);
+}
+
+static uint32_t F2026_OutputPhaseIncrement(uint32_t frequency_hz)
+{
+    uint32_t phase_increment = F2026_PhaseIncrementFromHz(frequency_hz);
+
+    if (state.reference_calibration_valid &&
+        (state.reference_calibration_ticks != 0U)) {
+        phase_increment = (uint32_t)((((uint64_t)phase_increment *
+                         F2026_REFERENCE_CALIBRATION_EXPECTED_TICKS) +
+                        (state.reference_calibration_ticks / 2U)) /
+                       state.reference_calibration_ticks);
+    }
+    return phase_increment;
 }
 
 void vApplicationMallocFailedHook(void)

@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define F2026_FPGA_PROTOCOL_VERSION 2U
+#define F2026_FPGA_PROTOCOL_VERSION 3U
 
 typedef enum {
     F2026_FPGA_MODE_IDLE = 0,
@@ -22,8 +22,10 @@ typedef struct {
     bool otr_seen;
     bool output_enabled;
     bool free_run;
+    bool calibration_done;
     uint32_t period_ticks;
     uint32_t edge_count;
+    uint32_t calibration_ticks;
     uint8_t sample_min;
     uint8_t sample_max;
     F2026_FpgaMode mode;
@@ -35,6 +37,7 @@ typedef struct {
     uint8_t amplitude_code;
     bool output_enable;
     bool free_run;
+    bool calibration_start;
     uint32_t phase_increment;
     uint32_t phase_offset;
     uint8_t dac_mid;

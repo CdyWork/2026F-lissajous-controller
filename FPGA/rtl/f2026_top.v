@@ -39,6 +39,8 @@ module f2026_top (
     wire [7:0] sample_min;
     wire [7:0] sample_max;
     wire otr_seen;
+    wire calibration_done;
+    wire [31:0] calibration_ticks;
 
     wire [2:0] mode;
     wire [7:0] amplitude;
@@ -48,6 +50,7 @@ module f2026_top (
     wire [31:0] phase_offset;
     wire [7:0] dac_mid;
     wire [7:0] threshold_hysteresis;
+    wire calibration_start;
     wire [7:0] effective_threshold_hysteresis;
     wire [31:0] phase_monitor;
     wire [31:0] tracked_phase_increment;
@@ -86,13 +89,16 @@ module f2026_top (
         .ad_data(ad_data),
         .ad_otr(ad_otr),
         .threshold_hysteresis(effective_threshold_hysteresis),
+        .calibration_start(calibration_start),
         .edge_pulse(input_edge),
         .locked(input_locked),
         .period_ticks(period_ticks),
         .edge_count(edge_count),
         .sample_min(sample_min),
         .sample_max(sample_max),
-        .otr_seen(otr_seen)
+        .otr_seen(otr_seen),
+        .calibration_done(calibration_done),
+        .calibration_ticks(calibration_ticks)
     );
 
     f2026_phase_increment phase_increment_inst (
@@ -165,10 +171,13 @@ module f2026_top (
         .edge_count(edge_count),
         .sample_min(sample_min),
         .sample_max(sample_max),
+        .calibration_done(calibration_done),
+        .calibration_ticks(calibration_ticks),
         .mode(mode),
         .amplitude(amplitude),
         .output_enable(output_enable),
         .free_run(free_run),
+        .calibration_start(calibration_start),
         .phase_increment(phase_increment),
         .phase_offset(phase_offset),
         .dac_mid(dac_mid),

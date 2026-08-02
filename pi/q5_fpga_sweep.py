@@ -29,7 +29,7 @@ else:
 
 
 RAMPS_US = (10, 30, 70, 150, 300, 500, 750, 1000)
-FRAME_US = 2000
+FRAME_US = 10000
 DWELL_MS = 400
 SETTLE_MS = 120
 GUARD_MS = 40
@@ -42,6 +42,7 @@ MIN_TRACE_FOREGROUND_PIXELS = 200
 MAX_MEASUREMENT_ATTEMPTS = 5
 SERVICE_SOCKET_PATH = "/tmp/q5_fpga_sweep.sock"
 KEY_MEASURE_EVENT = b"MEASURE"
+KEY_MEASURE_TASKS = (1, 2, 3)
 KEY_MEASURE_OUTPUT_ROOT = Path("/home/orangepi/2026F")
 TRACE_THRESHOLD = 18
 REPRESENTATIVE_TARGET_MS = 250.0
@@ -154,6 +155,22 @@ class Camera:
         self.stop()
 
 
+def parse_key_measure_event(line: bytes) -> int | None:
+    """Decode MCU keypad notifications; bare MEASURE remains task 1."""
+    fields = line.strip().upper().split()
+    if not fields or fields[0] != KEY_MEASURE_EVENT:
+        return None
+    if len(fields) == 1:
+        return 1
+    if len(fields) != 2:
+        return None
+    try:
+        task_number = int(fields[1])
+    except ValueError:
+        return None
+    return task_number if task_number in KEY_MEASURE_TASKS else None
+
+
 class Uart:
     """UART transport with a pyserial-free fallback for the Orange Pi."""
 
@@ -161,6 +178,7 @@ class Uart:
         self.timeout_s = timeout_s
         self.serial = None
         self.fd = -1
+        self.pending_events: list[int] = []
         try:
             import serial
         except ImportError:
@@ -189,22 +207,42 @@ class Uart:
         if self.serial is not None:
             self.serial.write(payload)
             self.serial.flush()
-            return self.serial.readline().decode("ascii", errors="replace").strip()
+            deadline = time.monotonic() + self.timeout_s
+            while time.monotonic() < deadline:
+                line = self.serial.readline().strip()
+                measure_task = parse_key_measure_event(line)
+                if measure_task is not None:
+                    self.pending_events.append(measure_task)
+                    continue
+                return line.decode("ascii", errors="replace")
+            return ""
 
         os.write(self.fd, payload)
         termios.tcdrain(self.fd)
         deadline = time.monotonic() + self.timeout_s
-        response: list[bytes] = []
         while time.monotonic() < deadline:
-            readable, _, _ = select.select([self.fd], [], [], deadline - time.monotonic())
-            if not readable:
-                break
-            byte = os.read(self.fd, 1)
-            if byte:
-                response.append(byte)
-            if byte == b"\n":
-                break
-        return b"".join(response).decode("ascii", errors="replace").strip()
+            response: list[bytes] = []
+            while time.monotonic() < deadline:
+                readable, _, _ = select.select([self.fd], [], [], deadline - time.monotonic())
+                if not readable:
+                    break
+                byte = os.read(self.fd, 1)
+                if byte:
+                    response.append(byte)
+                if byte == b"\n":
+                    break
+            line = b"".join(response).strip()
+            measure_task = parse_key_measure_event(line)
+            if measure_task is not None:
+                self.pending_events.append(measure_task)
+                continue
+            return line.decode("ascii", errors="replace")
+        return ""
+
+    def pop_event(self) -> int | None:
+        if not self.pending_events:
+            return None
+        return self.pending_events.pop(0)
 
     def fileno(self) -> int:
         if self.serial is not None:
@@ -710,6 +748,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-images", action="store_true", help="archive successful captures and diagnostics")
     parser.add_argument("--serve", action="store_true", help="hold the camera and UART open as a resident service")
     parser.add_argument("--trigger", action="store_true", help="request one measurement from the resident service")
+    parser.add_argument("--phase-check", action="store_true", help="read the current compensated phase error")
     parser.add_argument(
         "--analyze-dir",
         type=Path,
@@ -880,6 +919,29 @@ def send_measurement_result(uart: Uart, report: dict[str, object]) -> str:
     return reply
 
 
+def read_reference_calibration(uart: Uart) -> dict[str, object]:
+    """Read the last 100 kHz FPGA clock calibration retained by the MCU."""
+    reply = uart.command("STATUS")
+    fields: dict[str, str] = {}
+    for token in reply.split():
+        if "=" in token:
+            key, value = token.split("=", 1)
+            fields[key] = value
+    try:
+        calibration_done = int(fields.get("CAL", "0")) == 1
+        ticks = int(fields.get("CTICKS", "0"))
+    except ValueError:
+        calibration_done = False
+        ticks = 0
+    valid = calibration_done and 24_000_000 <= ticks <= 26_000_000
+    return {
+        "valid": valid,
+        "calibration_done": calibration_done,
+        "ticks": ticks,
+        "status_reply": reply,
+    }
+
+
 def service_loop(args: argparse.Namespace) -> int:
     """Serve local requests and KEY3 measurement events without reopening hardware."""
     socket_path = Path(args.socket_path)
@@ -898,8 +960,15 @@ def service_loop(args: argparse.Namespace) -> int:
                     prepare_idle_cache,
                     run_frequency_measurement,
                 )
+                from q5_phase_lock import (
+                    calibrate_double_phase,
+                    capture_phase_error,
+                    start_q5_phase_feedforward,
+                    run_q5_phase_lock,
+                )
 
                 idle_cache = prepare_idle_cache(uart, camera)
+                phase_servo = None
 
                 def current_idle_cache():
                     nonlocal idle_cache
@@ -907,9 +976,126 @@ def service_loop(args: argparse.Namespace) -> int:
                         idle_cache = prepare_idle_cache(uart, camera)
                     return idle_cache
 
+                def apply_result_and_phase_lock(
+                    report: dict[str, object], output_dir: Path,
+                    save_images: bool = False, task_number: int = 1,
+                ) -> dict[str, object]:
+                    nonlocal phase_servo
+                    if task_number not in KEY_MEASURE_TASKS:
+                        raise ValueError(f"unsupported Q5 task {task_number}")
+                    report["task_number"] = task_number
+                    # A new classification replaces the output frequency, so
+                    # never let an earlier visual servo compensate the new one.
+                    phase_servo = None
+                    report["mcu_result_reply"] = send_measurement_result(uart, report)
+                    if "frequency_hz" not in report:
+                        return report
+                    try:
+                        reference_calibration = read_reference_calibration(uart)
+                        report["reference_calibration"] = reference_calibration
+                        cache = current_idle_cache()
+                        initial_lock = run_q5_phase_lock(
+                            uart, camera, cache.corners, cache.blank
+                        )
+                        initial_lock["frequency_hz"] = report["frequency_hz"]
+                        initial_lock["reference_calibration"] = reference_calibration
+                        report["phase_lock"] = initial_lock
+                        phase_servo, feedforward_report = start_q5_phase_feedforward(
+                            uart, camera, cache.corners, cache.blank, initial_lock,
+                            output_dir / "phase" if save_images else None,
+                        )
+                        report["phase_feedforward"] = feedforward_report
+                    except Exception as error:
+                        # Preserve the valid frequency result even if an XY
+                        # camera frame is unsuitable for phase refinement.
+                        report["phase_lock"] = {"status": "failed", "reason": str(error)}
+                        return report
+
+                    post_modes = {2: "CIRCLE", 3: "DOUBLE"}
+                    if task_number not in post_modes:
+                        report["post_output"] = {
+                            "status": "running",
+                            "mode": "DIAG",
+                            "phase_offset_degrees": 0.0,
+                        }
+                        return report
+                    try:
+                        mode = post_modes[task_number]
+                        reply = uart.command(f"AUTO {mode}")
+                        if not reply.startswith("OK AUTO"):
+                            raise RuntimeError(
+                                f"MCU rejected task {task_number} output: {reply!r}"
+                            )
+                        transform = phase_servo.apply_output_transform(
+                            2.0 if task_number == 3 else 1.0
+                        )
+                        double_phase_calibration = None
+                        if task_number == 3:
+                            try:
+                                double_phase_calibration = calibrate_double_phase(
+                                    phase_servo,
+                                    camera,
+                                    cache.corners,
+                                    cache.blank,
+                                    output_dir / "phase" if save_images else None,
+                                )
+                            except Exception as calibration_error:
+                                double_phase_calibration = {
+                                    "status": "failed",
+                                    "reason": str(calibration_error),
+                                }
+                        report["post_output"] = {
+                            "status": "running",
+                            "mode": mode,
+                            "phase_offset_degrees": 90.0 if task_number == 2 else 0.0,
+                            "mcu_reply": reply,
+                            **transform,
+                        }
+                        if double_phase_calibration is not None:
+                            report["post_output"]["double_phase_calibration"] = (
+                                double_phase_calibration
+                            )
+                    except Exception as error:
+                        report["post_output"] = {
+                            "status": "failed",
+                            "reason": str(error),
+                        }
+                    return report
+
+                def run_key_measurement_event(task_number: int) -> None:
+                    output_dir = key_measurement_output_dir(args.key_output_root)
+                    print(json.dumps({
+                        "key_measure": True,
+                        "task_number": task_number,
+                        "output_dir": str(output_dir),
+                    }), flush=True)
+                    try:
+                        report = run_frequency_measurement(
+                            output_dir, uart, camera, idle_cache=current_idle_cache()
+                        )
+                        report = apply_result_and_phase_lock(
+                            report, output_dir, task_number=task_number
+                        )
+                        print(json.dumps({"key_measure_complete": True, "report": report}), flush=True)
+                    except Exception as error:
+                        try:
+                            send_measurement_result(uart, {})
+                        except Exception:
+                            pass
+                        print(json.dumps({"key_measure_error": str(error)}), flush=True)
+
                 uart_line = bytearray()
                 while True:
-                    ready, _, _ = select.select([listener, uart.fileno()], [], [])
+                    timeout_s = None
+                    if phase_servo is not None:
+                        timeout_s = max(
+                            0.0,
+                            min(phase_servo.next_due_s, phase_servo.next_visual_due_s)
+                            - time.monotonic(),
+                        )
+                    if uart.pending_events:
+                        timeout_s = 0.0
+                    ready, _, _ = select.select([listener, uart.fileno()], [], [], timeout_s)
                     if listener in ready:
                         connection, _ = listener.accept()
                         with connection, connection.makefile("rwb") as stream:
@@ -923,12 +1109,33 @@ def service_loop(args: argparse.Namespace) -> int:
                                     output_value = request.get("output_dir")
                                     if not isinstance(output_value, str) or not output_value:
                                         raise ValueError("MEASURE requires output_dir")
+                                    task_number = int(request.get("task_number", 1))
                                     response = run_frequency_measurement(
                                         Path(output_value), uart, camera,
                                         bool(request.get("save_images", False)),
                                         current_idle_cache(),
                                     )
-                                    response["mcu_result_reply"] = send_measurement_result(uart, response)
+                                    response = apply_result_and_phase_lock(
+                                        response, Path(output_value),
+                                        bool(request.get("save_images", False)), task_number,
+                                    )
+                                elif command == "PHASE_CHECK":
+                                    if phase_servo is None:
+                                        raise RuntimeError("phase compensation is not running")
+                                    if time.monotonic() >= phase_servo.next_due_s:
+                                        phase_servo.step()
+                                    phase_error, features = capture_phase_error(
+                                        camera, idle_cache.corners, idle_cache.blank
+                                    )
+                                    response = {
+                                        "status": "ok",
+                                        "phase_error_degrees": phase_error,
+                                        "phase_degrees": phase_servo.phase_at(),
+                                        "compensation_rate_degrees_per_s": (
+                                            phase_servo.compensation_rate_degrees_per_s
+                                        ),
+                                        "features": features,
+                                    }
                                 else:
                                     raise ValueError("unsupported command")
                             except Exception as error:
@@ -944,24 +1151,35 @@ def service_loop(args: argparse.Namespace) -> int:
                         while b"\n" in uart_line:
                             raw_line, _, remainder = uart_line.partition(b"\n")
                             uart_line = bytearray(remainder)
-                            if raw_line.rstrip(b"\r").strip().upper() == KEY_MEASURE_EVENT:
-                                output_dir = key_measurement_output_dir(args.key_output_root)
-                                print(json.dumps({"key_measure": True, "output_dir": str(output_dir)}), flush=True)
-                                try:
-                                    # Key measurements use the experimental
-                                    # table search. It never falls back to the
-                                    # legacy eight-setting SWEEP algorithm.
-                                    report = run_frequency_measurement(
-                                        output_dir, uart, camera, idle_cache=current_idle_cache()
-                                    )
-                                    report["mcu_result_reply"] = send_measurement_result(uart, report)
-                                    print(json.dumps({"key_measure_complete": True, "report": report}), flush=True)
-                                except Exception as error:
-                                    try:
-                                        send_measurement_result(uart, {})
-                                    except Exception:
-                                        pass
-                                    print(json.dumps({"key_measure_error": str(error)}), flush=True)
+                            task_number = parse_key_measure_event(raw_line.rstrip(b"\r"))
+                            if task_number is not None:
+                                run_key_measurement_event(task_number)
+                    while True:
+                        task_number = uart.pop_event()
+                        if task_number is None:
+                            break
+                        run_key_measurement_event(task_number)
+                    if phase_servo is not None and time.monotonic() >= phase_servo.next_due_s:
+                        try:
+                            phase_servo.step()
+                        except Exception as error:
+                            # A UART transient must not stall the service or
+                            # leave it in a tight retry loop.
+                            phase_servo.next_due_s = time.monotonic() + 0.5
+                            print(json.dumps({
+                                "phase_feedforward": {"status": "retry", "reason": str(error)}
+                            }), flush=True)
+                    if phase_servo is not None and time.monotonic() >= phase_servo.next_visual_due_s:
+                        try:
+                            visual_report = phase_servo.visual_step(
+                                camera, idle_cache.corners, idle_cache.blank
+                            )
+                            print(json.dumps({"phase_visual_servo": visual_report}), flush=True)
+                        except Exception as error:
+                            phase_servo.next_visual_due_s = time.monotonic() + 0.5
+                            print(json.dumps({
+                                "phase_visual_servo": {"status": "retry", "reason": str(error)}
+                            }), flush=True)
         finally:
             try:
                 socket_path.unlink()
@@ -988,10 +1206,24 @@ def trigger_measurement(args: argparse.Namespace) -> int:
     return 0 if response.get("status") != "failed_after_retry" and "frequency_hz" in response else 2
 
 
+def trigger_phase_check(args: argparse.Namespace) -> int:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(args.socket_path)
+        with client.makefile("rwb") as stream:
+            stream.write(b'{"command":"PHASE_CHECK"}\n')
+            stream.flush()
+            response_line = stream.readline(65536)
+    if not response_line:
+        raise RuntimeError("resident service closed without a response")
+    response = json.loads(response_line.decode("ascii"))
+    print(json.dumps(response), flush=True)
+    return 0 if response.get("status") == "ok" else 2
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if sum((args.analyze_dir is not None, args.serve, args.trigger)) > 1:
-        raise ValueError("choose only one of --analyze-dir, --serve, or --trigger")
+    if sum((args.analyze_dir is not None, args.serve, args.trigger, args.phase_check)) > 1:
+        raise ValueError("choose only one operating mode")
     if args.analyze_dir is not None:
         analyse_sweep(args.analyze_dir)
         return 0
@@ -1005,6 +1237,8 @@ def main(argv: list[str] | None = None) -> int:
         return service_loop(args)
     if args.trigger:
         return trigger_measurement(args)
+    if args.phase_check:
+        return trigger_phase_check(args)
     with Uart(args.serial) as uart, Camera(args.device, args.capture_fps) as camera:
         report = run_measurement(
             args.output_dir, uart, camera, args.sweep_cycles, args.trace_threshold, args.save_images

@@ -21,7 +21,7 @@ from .xy_extract import detect_xy_axes, draw_detection, median_frame
 # the homography removes both camera roll and keystone distortion.
 DEFAULT_XY_CORNERS = "194,202,412,216,416,413,204,410"
 FPGA_SWEEP_RAMPS_US = (10, 30, 70, 150, 300, 500, 750, 1000)
-FPGA_SWEEP_FRAME_US = 2000
+FPGA_SWEEP_FRAME_US = 10000
 FPGA_SWEEP_DWELL_MS = 400
 
 
@@ -84,8 +84,8 @@ def _rectify_xy(
 
 
 def _frame_period_us(ramp_us: int, frame_us: int) -> int:
-    if not (200 <= frame_us <= 2000):
-        raise ValueError("frame-us must be within 200..2000 us")
+    if not (200 <= frame_us <= 10000):
+        raise ValueError("frame-us must be within 200..10000 us")
     if frame_us % 200 != 0:
         raise ValueError("frame-us must be a multiple of 200 us")
     if frame_us <= ramp_us:
@@ -138,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--frame-us",
         type=int,
-        default=2000,
+        default=10000,
         help="fixed cyclic period for every ramp; must be a 200 us multiple",
     )
     parser.add_argument(

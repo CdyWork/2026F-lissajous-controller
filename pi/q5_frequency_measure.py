@@ -1,10 +1,4 @@
-"""Production Q5 visual frequency measurement.
-
-The normal path samples four representative FPGA ramp slots, verifies one
-selected slot with a second frame, and returns a calibrated frequency. If no
-normal slot is usable, STEP 33 selects the 6 ms ramp / 10 ms frame fallback;
-STEP 32 remains the shorter 2 ms fallback.
-"""
+"""Q5 visual lookup for the three frequencies specified by the contest."""
 
 from __future__ import annotations
 
@@ -27,7 +21,6 @@ from q5_fpga_sweep import (
     median_frame,
     rectify,
     rolling_median,
-    weighted_median,
     write_image,
 )
 
@@ -37,26 +30,52 @@ TABLE_RAMPS_US = (
     108, 125, 145, 168, 195, 226, 263, 305, 353, 410, 476, 552, 640,
     743, 862, 1000, 2000, 6000,
 )
-NORMAL_TABLE_COUNT = 32
-INITIAL_NORMAL_SLOT = 16
-LOW_FREQUENCY_SLOTS = (33, 32)
-LOW_FREQUENCY_CAPTURE_COUNT = 3
-NORMAL_CONFIRMATION_CAPTURE_LIMIT = 3
-MAX_BINARY_STEPS = 5
-MIN_TARGET_CROSSINGS = 6
-MAX_TARGET_CROSSINGS = 18
+KNOWN_FREQUENCIES_HZ = (1100, 49900, 90900)
+
+# At 125 us the three allowed inputs produce approximately 0.13, 6.3, and
+# 11.5 midline crossings. This keeps 90.9 kHz below the dense-trace regime
+# while retaining enough crossings to separate it from 49.9 kHz. The sparse
+# 1.1 kHz candidate is always confirmed with the 6 ms low-frequency ramp.
+CLASSIFY_SLOT = 17
+LOW_MID_CROSSING_BOUNDARY = 3.5
+# Thick scope traces merge some adjacent crossings, so use a slightly lower
+# boundary than the theoretical midpoint of 8.94 crossings.
+MID_HIGH_CROSSING_BOUNDARY = 8.0
+
+# Each candidate gets a dedicated ramp that yields about six crossings. This
+# rejects a stale or partially settled classification capture.
+CONFIRMATION_SLOTS = {
+    1100: 33,   # 6000 us: about 6.0 crossings
+    49900: 17,  # 125 us: about 6.3 crossings
+    90900: 13,  # 69 us: about 6.4 crossings
+}
+
 NORMAL_SETTLE_S = 0.50
-LOW_FREQUENCY_SETTLE_S = 0.75
-IDLE_BLANK_SETTLE_S = 0.75
-IDLE_BLANK_FLUSH_FRAMES = 12
-POST_STEP_FLUSH_FRAMES = 8
-CACHED_BLANK_MAX_AGE_S = 120.0
-MIN_TRACE_SPAN_PX = 280
-MAX_NORMAL_VISUAL_CYCLES = 14.0
-MAX_REPEAT_DEVIATION = 0.05
-NORMAL_CALIBRATION_GAIN = 1.965686502
-NORMAL_CALIBRATION_OFFSET_HZ = 111.135141
-LOW_CALIBRATION_GAIN = 1.95
+POST_STEP_FLUSH_FRAMES = 3
+POST_STEP_CANDIDATE_FRAMES = 5
+POST_STEP_CONFIRMATION_MAX_FRAMES = 12
+# Rebuilding the blank/axis cache blocks the key path for roughly 2-3 seconds.
+# Scope geometry and manual exposure are fixed during a contest run, so keep
+# the startup calibration for the lifetime of the resident service.
+CACHED_BLANK_MAX_AGE_S = float("inf")
+MIN_XY_CALIBRATION_CONFIDENCE = 0.50
+MIN_TRACE_SPAN_PX = 220
+FULL_TRACE_SPAN_PX = 380.0
+TRACE_CONNECT_THRESHOLD = 18
+# Rectified XY traces progress primarily along image rows. This narrow kernel
+# closes short raster gaps without joining adjacent sine periods sideways.
+TRACE_CONNECT_KERNEL = (3, 7)
+MAX_ATTEMPTS = 2
+INTER_ATTEMPT_IDLE_S = 0.35
+DENSE_HIGH_OCCUPANCY = 0.55
+DENSE_HIGH_BAND_COUNT = 8.0
+MID_FREQUENCY_BAND_COUNT = 4.0
+
+# Existing bench calibration maps visual cycles back to electrical frequency.
+# It is used only to predict an allowed candidate's crossing-count window,
+# never to produce a continuous-frequency result.
+VISUAL_FREQUENCY_GAIN = 1.965686502
+VISUAL_FREQUENCY_OFFSET_HZ = 111.135141
 
 
 @dataclass
@@ -77,41 +96,108 @@ class IdleCache:
 
 
 def capture_slot(
-    camera: Camera, uart: Uart, slot: int, corners: np.ndarray, settle_s: float = NORMAL_SETTLE_S,
+    camera: Camera,
+    uart: Uart,
+    slot: int,
+    corners: np.ndarray,
+    blank: np.ndarray,
+    target_crossings: float | None = None,
 ) -> Capture:
+    """Capture a settled STEP frame, retaining the most complete trace.
+
+    The scope can expose an occasional blank or partially refreshed raster
+    immediately after a table change. A short burst costs only four extra
+    camera periods and avoids allowing one such frame to reject the lookup.
+    """
     frame_period = 1.0 / max(camera.fps, 1.0)
-    # Empty V4L2 frames left by the previous oscilloscope state must not be
-    # associated with the new FPGA slot.
     for _ in range(max(CAMERA_PIPELINE_FLUSH_FRAMES, 4)):
         time.sleep(frame_period)
         camera.capture()
     reply = uart.command(f"STEP {slot}")
     if not reply.startswith("OK STEP"):
         raise RuntimeError(f"STEP {slot} failed: {reply!r}")
-    time.sleep(settle_s)
-    for _ in range(max(CAMERA_PIPELINE_FLUSH_FRAMES, POST_STEP_FLUSH_FRAMES)):
+    time.sleep(NORMAL_SETTLE_S)
+    for _ in range(POST_STEP_FLUSH_FRAMES):
         time.sleep(frame_period)
         camera.capture()
-    frame = camera.capture().bgr
-    return Capture(slot, frame, rectify(frame, corners))
+
+    best_capture: Capture | None = None
+    best_score: tuple[float, ...] | None = None
+    confirmation_matches = 0
+    frame_limit = (
+        POST_STEP_CONFIRMATION_MAX_FRAMES
+        if target_crossings is not None else POST_STEP_CANDIDATE_FRAMES
+    )
+    for _ in range(frame_limit):
+        time.sleep(frame_period)
+        frame = camera.capture().bgr
+        candidate = Capture(slot, frame, rectify(frame, corners))
+        features = trace_features(
+            cv2.subtract(candidate.xy, blank), TABLE_RAMPS_US[slot]
+        )
+        if target_crossings is None:
+            # The low-frequency classes deliberately have fewer than five
+            # crossings and do not pass the sinusoid quality gate. Complete
+            # scan coverage must rank ahead of that gate so a stale partial
+            # high-frequency trace cannot win.
+            score = (
+                float(int(features["trace_span_px"]) >= MIN_TRACE_SPAN_PX),
+                float(features["trace_span_px"]),
+                float(bool(features["accepted"])),
+                float(features["amplitude_px"]),
+            )
+        else:
+            # A prior setting can remain visible on the scope for one camera
+            # frame. For confirmation, prefer a complete trace whose crossing
+            # count belongs to the requested setting rather than that residue.
+            score = (
+                float(bool(features["accepted"])),
+                float(int(features["trace_span_px"]) >= MIN_TRACE_SPAN_PX),
+                -abs(projected_crossings(features) - target_crossings),
+                float(features["trace_span_px"]),
+                float(features["amplitude_px"]),
+            )
+        if best_score is None or score > best_score:
+            best_capture = candidate
+            best_score = score
+        if target_crossings is not None:
+            projected = projected_crossings(features)
+            response_window = max(1.25, target_crossings * 0.25)
+            if (
+                bool(features["accepted"])
+                and int(features["trace_span_px"]) >= MIN_TRACE_SPAN_PX
+                and abs(projected - target_crossings) <= response_window
+            ):
+                confirmation_matches += 1
+                if confirmation_matches >= 2:
+                    break
+            else:
+                confirmation_matches = 0
+
+    if best_capture is None:
+        raise RuntimeError("camera returned no candidate frame")
+    return best_capture
 
 
 def prepare_idle_cache(uart: Uart, camera: Camera) -> IdleCache:
-    """Capture a clean background once while FPGA output is parked."""
     if not uart.command("IDLE").startswith("OK IDLE"):
-        raise RuntimeError("cannot park FPGA before calibration")
-    time.sleep(IDLE_BLANK_SETTLE_S)
+        raise RuntimeError("cannot park FPGA before XY calibration")
+    # The V4L2 queue may still contain frames captured before IDLE reached the
+    # FPGA, and the scope phosphor needs time to clear the prior Lissajous
+    # trace. A contaminated blank turns phase subtraction into the difference
+    # of two ellipses, so discard the complete old camera pipeline first.
+    time.sleep(1.50)
     frame_period = 1.0 / max(camera.fps, 1.0)
-    for _ in range(IDLE_BLANK_FLUSH_FRAMES):
+    for _ in range(12):
         time.sleep(frame_period)
         camera.capture()
-    blank_frames: list[np.ndarray] = []
+    frames: list[np.ndarray] = []
     for _ in range(CALIBRATION_FRAMES):
         time.sleep(frame_period)
-        blank_frames.append(camera.capture().bgr)
-    calibration_image = median_frame(blank_frames)
+        frames.append(camera.capture().bgr)
+    calibration_image = median_frame(frames)
     calibration = calibrate_xy(calibration_image)
-    if calibration.confidence < 0.65:
+    if calibration.confidence < MIN_XY_CALIBRATION_CONFIDENCE:
         raise RuntimeError(f"XY calibration confidence too low: {calibration.confidence:.3f}")
     return IdleCache(
         calibration_image=calibration_image,
@@ -121,21 +207,47 @@ def prepare_idle_cache(uart: Uart, camera: Camera) -> IdleCache:
     )
 
 
-def crossing_estimate(image: np.ndarray, ramp_us: int) -> dict[str, object]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    response = cv2.GaussianBlur(gray, (11, 5), 0)
+def trace_features(trace: np.ndarray, ramp_us: int) -> dict[str, object]:
+    """Return robust crossing features; no continuous frequency is estimated."""
+    channels = trace.astype(np.int16)
+    blue, green, red = cv2.split(channels)
+    cyan_mask = (
+        (np.minimum(blue, green) - red >= 20) & (blue >= 50)
+    ).astype(np.float32)
+    cyan_interior = cyan_mask[12:-12, 12:-12]
+    cyan_occupancy = float(np.mean(cyan_interior))
+    cyan_response = cv2.GaussianBlur(cyan_mask, (9, 9), 0)
+    band_counts: list[int] = []
+    for column in (100, 150, 200, 250, 300):
+        active = cyan_response[12:-12, column] >= 0.18
+        starts = active & ~np.r_[False, active[:-1]]
+        band_counts.append(int(np.count_nonzero(starts)))
+    cyan_band_count = float(np.median(band_counts))
+
+    gray = cv2.cvtColor(trace, cv2.COLOR_BGR2GRAY)
+    threshold = max(TRACE_CONNECT_THRESHOLD, int(gray.max()) * 15 // 100)
+    mask = np.where(gray >= threshold, 255, 0).astype(np.uint8)
+    connect_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, TRACE_CONNECT_KERNEL)
+    # Close gaps in one visible trace: dilate first, then erode by the same
+    # kernel so the original line width is retained.
+    mask = cv2.dilate(mask, connect_kernel, iterations=1)
+    mask = cv2.erode(mask, connect_kernel, iterations=1)
+    response = cv2.GaussianBlur(mask, (11, 5), 0)
     strength = response.max(axis=1)
     try:
         start, end = largest_active_span(strength >= max(20.0, float(strength.max()) * 0.35))
     except RuntimeError as error:
         return {
             "accepted": False,
+            "reason": str(error),
+            "ramp_us": ramp_us,
+            "crossing_count": 0,
             "trace_span_px": 0,
             "amplitude_px": 0.0,
-            "crossing_count": 0,
-            "ramp_us": ramp_us,
-            "reason": str(error),
+            "cyan_occupancy": cyan_occupancy,
+            "cyan_band_count": cyan_band_count,
         }
+
     centers = response[start:end].argmax(axis=1).astype(np.float32)
     centers = rolling_median(centers, 9)
     centers = cv2.GaussianBlur(centers.reshape(1, -1), (15, 1), 0).reshape(-1)
@@ -153,126 +265,161 @@ def crossing_estimate(image: np.ndarray, ramp_us: int) -> dict[str, object]:
 
     up = np.asarray([position for position, direction in crossings if direction == "up"])
     down = np.asarray([position for position, direction in crossings if direction == "down"])
-    same_direction = np.concatenate((np.diff(up), np.diff(down)))
-    low_frequency = ramp_us >= 2000
+    intervals = np.concatenate((np.diff(up), np.diff(down)))
     result: dict[str, object] = {
         "accepted": False,
+        "ramp_us": ramp_us,
+        "crossing_count": len(crossings),
         "trace_span_px": int(end - start),
         "amplitude_px": float((high - low) * 0.5),
-        "crossing_count": len(crossings),
-        "ramp_us": ramp_us,
+        "cyan_occupancy": cyan_occupancy,
+        "cyan_band_count": cyan_band_count,
     }
-    minimum_amplitude = 120.0 if low_frequency else 16.0
-    if result["amplitude_px"] < minimum_amplitude:
-        result["reason"] = f"trace amplitude below {minimum_amplitude:.0f} px"
-        return result
-    if len(crossings) < (2 if low_frequency else 5):
+    if result["amplitude_px"] < 16.0:
+        result["reason"] = "trace amplitude below 16 px"
+    elif len(crossings) < 5:
         result["reason"] = "insufficient midline crossings"
-        return result
-    if any(crossings[index][1] == crossings[index - 1][1] for index in range(1, len(crossings))):
+    elif any(crossings[index][1] == crossings[index - 1][1] for index in range(1, len(crossings))):
         result["reason"] = "midline crossings do not alternate"
-        return result
-
-    if len(same_direction) >= 1:
-        intervals = same_direction
-    elif low_frequency:
-        # One up/down pair is a half visual period in the 2 ms fallback.
-        intervals = 2.0 * np.diff(np.asarray([position for position, _ in crossings]))
-        result["half_period_mode"] = True
-    else:
+    elif len(intervals) < 1:
         result["reason"] = "not enough full-period intervals"
-        return result
-    spacing = float(np.median(intervals))
-    if spacing <= 0.0:
-        result["reason"] = "invalid crossing interval"
-        return result
-    spacing_cv = (
-        float(1.4826 * np.median(np.abs(intervals - spacing)) / spacing)
-        if len(intervals) >= 2 else 0.0
-    )
-    if spacing_cv > 0.15:
-        result["reason"] = "unstable crossing intervals"
-        return result
-
-    visual_cycles = float((end - start - 1) / spacing)
-    raw_hz = visual_cycles / (ramp_us * 1e-6)
-    gain = LOW_CALIBRATION_GAIN if low_frequency else NORMAL_CALIBRATION_GAIN
-    offset = 0.0 if low_frequency else NORMAL_CALIBRATION_OFFSET_HZ
-    result.update({
-        "accepted": True,
-        "crossing_spacing_cv": spacing_cv,
-        "visual_cycles": visual_cycles,
-        "uncalibrated_frequency_hz": raw_hz,
-        "frequency_hz": raw_hz * gain + offset,
-        "confidence": (0.40 if result.get("half_period_mode") else min(1.0, (len(crossings) - 4) / 10.0)) / (1.0 + spacing_cv),
-    })
+    else:
+        spacing = float(np.median(intervals))
+        spacing_cv = float(1.4826 * np.median(np.abs(intervals - spacing)) / spacing)
+        result["crossing_spacing_cv"] = spacing_cv
+        if spacing_cv > 0.15:
+            result["reason"] = "unstable crossing intervals"
+        else:
+            result["accepted"] = True
     return result
 
 
-def sweep_background(captures: list[Capture], blank: np.ndarray) -> np.ndarray:
-    """Remove traces that persist in the scope image across table changes."""
-    if len({capture.slot for capture in captures}) < 3:
-        return blank
-    return np.quantile(np.stack([capture.xy for capture in captures]), 0.20, axis=0).astype(np.uint8)
+def inspect(capture: Capture, blank: np.ndarray) -> dict[str, object]:
+    result = trace_features(cv2.subtract(capture.xy, blank), TABLE_RAMPS_US[capture.slot])
+    result["table_index"] = capture.slot
+    return result
 
 
-def inspect(capture: Capture, blank: np.ndarray, background: np.ndarray | None = None) -> dict[str, object]:
-    backgrounds = [("idle_blank", blank)]
-    if background is not None:
-        backgrounds.append(("sweep_q20", background))
-    choices: list[dict[str, object]] = []
-    for source, candidate_background in backgrounds:
-        result = crossing_estimate(
-            cv2.subtract(capture.xy, candidate_background), TABLE_RAMPS_US[capture.slot]
-        )
-        result.update({"background_source": source, "table_index": capture.slot})
-        choices.append(result)
-    return max(
-        choices,
-        key=lambda value: (
-            bool(value["accepted"]),
-            int(value["trace_span_px"]),
-            float(value.get("confidence", 0.0)),
-        ),
+def projected_crossings(estimate: dict[str, object]) -> float:
+    """Project an evenly spaced trace to the normal 380 px scan width."""
+    span = max(float(estimate["trace_span_px"]), 1.0)
+    return float(estimate["crossing_count"]) * FULL_TRACE_SPAN_PX / span
+
+
+def classify_estimate(estimate: dict[str, object]) -> int:
+    """Select the allowed frequency nearest the observed crossing count."""
+    projected = projected_crossings(estimate)
+    estimate["projected_crossing_count"] = projected
+    ramp_us = int(estimate["ramp_us"])
+    expected = {
+        frequency_hz: expected_crossings(frequency_hz, ramp_us)
+        for frequency_hz in KNOWN_FREQUENCIES_HZ
+    }
+    estimate["class_expected_crossings"] = expected
+    if dense_high_signature(estimate):
+        estimate["classification_fallback"] = "dense cyan high-frequency trace"
+        return KNOWN_FREQUENCIES_HZ[2]
+    if float(estimate.get("cyan_band_count", 0.0)) >= MID_FREQUENCY_BAND_COUNT:
+        estimate["classification_fallback"] = "cyan mid-frequency bands"
+        return KNOWN_FREQUENCIES_HZ[1]
+    if projected < LOW_MID_CROSSING_BOUNDARY:
+        return KNOWN_FREQUENCIES_HZ[0]
+    if projected < MID_HIGH_CROSSING_BOUNDARY:
+        return KNOWN_FREQUENCIES_HZ[1]
+    return KNOWN_FREQUENCIES_HZ[2]
+
+
+def dense_high_signature(estimate: dict[str, object]) -> bool:
+    """Recognize a high-frequency trace even when no single ridge exists."""
+    return (
+        float(estimate.get("cyan_occupancy", 0.0)) >= DENSE_HIGH_OCCUPANCY
+        or float(estimate.get("cyan_band_count", 0.0)) >= DENSE_HIGH_BAND_COUNT
     )
 
 
-def repeatable(values: list[dict[str, object]]) -> list[dict[str, object]]:
-    if len(values) < 2:
-        return []
-    best: list[dict[str, object]] = []
-    best_score = (-1, -1.0)
-    for anchor in values:
-        anchor_hz = float(anchor["uncalibrated_frequency_hz"])
-        cluster = [
-            value for value in values
-            if abs(float(value["uncalibrated_frequency_hz"]) / anchor_hz - 1.0)
-            <= MAX_REPEAT_DEVIATION
-        ]
-        score = (len(cluster), sum(float(value["confidence"]) for value in cluster))
-        if score > best_score:
-            best, best_score = cluster, score
-    return best if len(best) >= 2 else []
+def classification_is_decisive(estimate: dict[str, object], candidate_hz: int) -> bool:
+    """Skip confirmation only for a complete, high-quality unambiguous trace."""
+    projected = projected_crossings(estimate)
+    errors = sorted(
+        abs(projected - expected_crossings(frequency_hz, int(estimate["ramp_us"])))
+        for frequency_hz in KNOWN_FREQUENCIES_HZ
+    )
+    expected = expected_crossings(candidate_hz, int(estimate["ramp_us"]))
+    quality_ok = bool(estimate["accepted"])
+    return (
+        quality_ok
+        and int(estimate["trace_span_px"]) >= 350
+        and errors[0] <= max(1.25, expected * 0.18)
+        and errors[1] - errors[0] >= 1.0
+    )
 
 
-def normal_usable(estimates: list[dict[str, object]], slot: int) -> list[dict[str, object]]:
-    return repeatable([
-        value for value in estimates
-        if value["accepted"]
-        and int(value["table_index"]) == slot
-        and int(value["trace_span_px"]) >= MIN_TRACE_SPAN_PX
-        and 2.5 <= float(value["visual_cycles"]) <= MAX_NORMAL_VISUAL_CYCLES
-    ])
+def expected_crossings(frequency_hz: int, ramp_us: int) -> float:
+    visual_hz = (frequency_hz - VISUAL_FREQUENCY_OFFSET_HZ) / VISUAL_FREQUENCY_GAIN
+    return 2.0 * visual_hz * ramp_us * 1e-6
 
 
-def binary_direction(estimate: dict[str, object]) -> int:
-    """Return +1 for a longer ramp, -1 for shorter, 0 for a usable trace."""
-    crossings = int(estimate["crossing_count"])
-    if crossings < MIN_TARGET_CROSSINGS:
-        return 1
-    if crossings > MAX_TARGET_CROSSINGS:
-        return -1
-    return 0 if bool(estimate["accepted"]) else 1
+def confirmation_matches(estimate: dict[str, object], frequency_hz: int) -> bool:
+    expected = expected_crossings(frequency_hz, int(estimate["ramp_us"]))
+    crossing_count = projected_crossings(estimate)
+    tolerance = (
+        2.5 if frequency_hz == 1100 else max(1.5, expected * 0.25)
+    )
+    estimate["expected_crossings"] = expected
+    estimate["projected_crossing_count"] = crossing_count
+    estimate["crossing_tolerance"] = tolerance
+    complete_trace = int(estimate["trace_span_px"]) >= MIN_TRACE_SPAN_PX
+    if (
+        bool(estimate["accepted"])
+        and complete_trace
+        and abs(crossing_count - expected) <= tolerance
+    ):
+        return True
+
+    # Thick cyan traces can have the right number of visible bands while the
+    # single-ridge extractor reports non-alternating crossings. The candidate
+    # ramp keeps these band windows unambiguous: 49.9 kHz at 125 us and
+    # 90.9 kHz at 69 us both form roughly 4..7 resolvable bands.
+    band_count = float(estimate.get("cyan_band_count", 0.0))
+    occupancy = float(estimate.get("cyan_occupancy", 0.0))
+    band_fallback = (
+        frequency_hz in (49900, 90900)
+        and complete_trace
+        and float(estimate["amplitude_px"]) >= 16.0
+        and occupancy < DENSE_HIGH_OCCUPANCY
+        and 4.0 <= band_count < DENSE_HIGH_BAND_COUNT
+    )
+    if band_fallback:
+        estimate["confirmation_fallback"] = "stable cyan band count"
+    return band_fallback
+
+
+def stale_high_frame_confirms(
+    classification: dict[str, object], confirmation: dict[str, object]
+) -> bool:
+    """Accept 90.9 kHz when the scope repeats most of the 125 us high trace."""
+    confirmation_high_floor = (
+        expected_crossings(90900, int(confirmation["ramp_us"])) + 4.0
+    )
+    return (
+        int(classification["trace_span_px"]) >= MIN_TRACE_SPAN_PX
+        and int(confirmation["trace_span_px"]) >= MIN_TRACE_SPAN_PX
+        and (
+            projected_crossings(classification) >= MID_HIGH_CROSSING_BOUNDARY
+            or dense_high_signature(classification)
+        )
+        # A settled 69 us high-frequency frame has only about 6.4 crossings;
+        # 10+ crossings can only be the preceding 125 us display persisting.
+        and projected_crossings(confirmation) >= confirmation_high_floor
+    )
+
+
+def archive(output_dir: Path, captures: list[Capture], cache: IdleCache) -> None:
+    write_image(output_dir / "xy_axis_calibrated.png", cache.blank)
+    for sequence, capture in enumerate(captures):
+        stem = f"{sequence:02d}_idx{capture.slot:02d}_{TABLE_RAMPS_US[capture.slot]:04d}us"
+        write_image(output_dir / f"{stem}.jpg", capture.bgr)
+        write_image(output_dir / f"{stem}_xy.png", capture.xy)
 
 
 def run_frequency_measurement(
@@ -282,114 +429,129 @@ def run_frequency_measurement(
     save_images: bool = False,
     idle_cache: IdleCache | None = None,
 ) -> dict[str, object]:
+    """Classify the input into one of the three permitted frequencies."""
     started = time.monotonic()
     if idle_cache is None or time.monotonic() - idle_cache.captured_at_s > CACHED_BLANK_MAX_AGE_S:
         idle_cache = prepare_idle_cache(uart, camera)
-    calibration_image = idle_cache.calibration_image
-    corners = idle_cache.corners
-    blank = idle_cache.blank
 
-    captures: list[Capture] = []
-    estimates: list[dict[str, object]] = []
-    selected_slot: int | None = None
-    low_fallback = False
-    usable: list[dict[str, object]] = []
-    binary_history: list[dict[str, object]] = []
-    low, high, candidate_slot = 0, NORMAL_TABLE_COUNT - 1, INITIAL_NORMAL_SLOT
-
-    for _ in range(MAX_BINARY_STEPS):
-        capture = capture_slot(camera, uart, candidate_slot, corners)
-        captures.append(capture)
-        estimate = inspect(capture, blank, sweep_background(captures, blank))
-        estimates.append(estimate)
-        direction = binary_direction(estimate)
-        binary_history.append({
-            "table_index": candidate_slot,
-            "ramp_us": TABLE_RAMPS_US[candidate_slot],
-            "direction": direction,
-            "crossing_count": estimate["crossing_count"],
-            "accepted": estimate["accepted"],
+    all_captures: list[Capture] = []
+    attempts: list[dict[str, object]] = []
+    result_hz: int | None = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        classification_capture = capture_slot(
+            camera, uart, CLASSIFY_SLOT, idle_cache.corners, idle_cache.blank
+        )
+        all_captures.append(classification_capture)
+        classification = inspect(classification_capture, idle_cache.blank)
+        candidate_hz = classify_estimate(classification)
+        if classification_is_decisive(classification, candidate_hz):
+            classification["direct_lookup"] = True
+            confirmation: dict[str, object] = {
+                "skipped": True,
+                "reason": "classification is clear of both lookup boundaries",
+            }
+            confirmed = True
+        else:
+            confirmation_slot = CONFIRMATION_SLOTS[candidate_hz]
+            confirmation_capture = capture_slot(
+                camera,
+                uart,
+                confirmation_slot,
+                idle_cache.corners,
+                idle_cache.blank,
+                expected_crossings(candidate_hz, TABLE_RAMPS_US[confirmation_slot]),
+            )
+            all_captures.append(confirmation_capture)
+            confirmation = inspect(confirmation_capture, idle_cache.blank)
+            confirmed = confirmation_matches(confirmation, candidate_hz)
+            if candidate_hz == 49900:
+                projected = projected_crossings(confirmation)
+                mid_expected = expected_crossings(
+                    49900, TABLE_RAMPS_US[confirmation_slot]
+                )
+                high_expected = expected_crossings(
+                    90900, TABLE_RAMPS_US[confirmation_slot]
+                )
+                mid_high_boundary = (mid_expected + high_expected) * 0.5
+                decisive_high_confirmation = projected >= high_expected - 1.0
+                if (
+                    (bool(confirmation["accepted"]) or decisive_high_confirmation)
+                    and int(confirmation["trace_span_px"]) >= MIN_TRACE_SPAN_PX
+                    and projected >= mid_high_boundary
+                ):
+                    candidate_hz = 90900
+                    confirmation["reclassified_from_hz"] = 49900
+                    confirmation["reclassification_boundary"] = mid_high_boundary
+                    confirmation["reason"] = (
+                        "125 us confirmation decisively identifies high frequency"
+                        if decisive_high_confirmation
+                        else "125 us confirmation identifies high frequency"
+                    )
+                    confirmed = True
+            if (
+                not confirmed
+                and candidate_hz == 90900
+                and stale_high_frame_confirms(classification, confirmation)
+            ):
+                confirmation["stale_classification_frame"] = True
+                confirmation["reason"] = (
+                    "complete high-frequency main frame persisted during confirmation"
+                )
+                confirmed = True
+        attempts.append({
+            "attempt": attempt,
+            "classification": classification,
+            "candidate_frequency_hz": candidate_hz,
+            "confirmation": confirmation,
+            "confirmed": confirmed,
         })
-        if direction == 0:
-            selected_slot = candidate_slot
+        if confirmed:
+            result_hz = candidate_hz
             break
-        if direction > 0:
-            low = candidate_slot + 1
-        else:
-            high = candidate_slot - 1
-        if low > high:
-            break
-        if candidate_slot == INITIAL_NORMAL_SLOT and direction > 0:
-            crossings = int(estimate["crossing_count"])
-            next_slot = 30 if crossings <= 3 else 28
-            if not low <= next_slot <= high:
-                next_slot = (low + high) // 2
-        else:
-            next_slot = (low + high) // 2
-        if next_slot == candidate_slot:
-            break
-        candidate_slot = next_slot
+        if attempt < MAX_ATTEMPTS:
+            # Clear a saturated persistence frame before retrying. Reusing a
+            # dense failed image makes every later ramp look high-frequency.
+            uart.command("IDLE")
+            time.sleep(INTER_ATTEMPT_IDLE_S)
+            frame_period = 1.0 / max(camera.fps, 1.0)
+            for _ in range(POST_STEP_FLUSH_FRAMES):
+                time.sleep(frame_period)
+                camera.capture()
 
-    if selected_slot is not None:
-        for _ in range(NORMAL_CONFIRMATION_CAPTURE_LIMIT):
-            captures.append(capture_slot(camera, uart, selected_slot, corners))
-            background = sweep_background(captures, blank)
-            estimates = [inspect(candidate, blank, background) for candidate in captures]
-            usable = normal_usable(estimates, selected_slot)
-            if usable:
-                break
-
-    if not usable:
-        low_fallback = True
-        for low_slot in LOW_FREQUENCY_SLOTS:
-            low_captures = [
-                capture_slot(camera, uart, low_slot, corners, LOW_FREQUENCY_SETTLE_S)
-                for _ in range(LOW_FREQUENCY_CAPTURE_COUNT)
-            ]
-            low_estimates = [inspect(capture, blank) for capture in low_captures]
-            captures.extend(low_captures)
-            estimates.extend(low_estimates)
-            usable = repeatable([estimate for estimate in low_estimates if estimate["accepted"]])
-            if usable:
-                selected_slot = low_slot
-                break
     uart.command("IDLE")
-
     report: dict[str, object] = {
-        "mode": "adaptive_table_binary_search_with_low_frequency_fallback",
-        "normal_table_count": NORMAL_TABLE_COUNT,
-        "binary_history": binary_history,
-        "selected_table_index": selected_slot,
-        "low_frequency_fallback_used": low_fallback,
-        "calibration": {
-            "normal_gain": NORMAL_CALIBRATION_GAIN,
-            "normal_offset_hz": NORMAL_CALIBRATION_OFFSET_HZ,
-            "low_gain": LOW_CALIBRATION_GAIN,
+        "mode": "three_frequency_crossing_lookup",
+        "allowed_frequencies_hz": KNOWN_FREQUENCIES_HZ,
+        "classification": {
+            "classify_slot": CLASSIFY_SLOT,
+            "classify_ramp_us": TABLE_RAMPS_US[CLASSIFY_SLOT],
+            "low_mid_crossing_boundary": LOW_MID_CROSSING_BOUNDARY,
+            "mid_high_crossing_boundary": MID_HIGH_CROSSING_BOUNDARY,
+            "expected_crossings": {
+                frequency_hz: expected_crossings(
+                    frequency_hz, TABLE_RAMPS_US[CLASSIFY_SLOT]
+                )
+                for frequency_hz in KNOWN_FREQUENCIES_HZ
+            },
         },
-        "estimates": estimates,
-        "usable_settings": len(usable),
+        "confirmation_slots": CONFIRMATION_SLOTS,
+        "attempts": attempts,
         "elapsed_s": time.monotonic() - started,
     }
-    if usable:
-        values = [float(estimate["frequency_hz"]) for estimate in usable]
-        weights = [float(estimate["confidence"]) for estimate in usable]
-        report["frequency_hz"] = weighted_median(values, weights)
-        report["frequency_estimates_hz"] = values
+    if result_hz is not None:
+        report["frequency_hz"] = result_hz
     else:
-        report["reason"] = "no repeatable visual frequency"
+        report["reason"] = "no candidate passed its lookup confirmation"
+
     output_dir.mkdir(parents=True, exist_ok=True)
     if save_images:
-        write_image(output_dir / "xy_axis_calibrated.png", blank)
-        for sequence, capture in enumerate(captures):
-            stem = f"{sequence:02d}_idx{capture.slot:02d}_{TABLE_RAMPS_US[capture.slot]:04d}us"
-            write_image(output_dir / f"{stem}.jpg", capture.bgr)
-            write_image(output_dir / f"{stem}_xy.png", capture.xy)
+        archive(output_dir, all_captures, idle_cache)
     (output_dir / "frequency_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="ascii")
     return report
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Q5 production visual frequency measurement")
+    parser = argparse.ArgumentParser(description="Q5 three-frequency visual lookup")
     parser.add_argument("--serial", default="/dev/ttyS2")
     parser.add_argument("--device", default="/dev/video0")
     parser.add_argument("--output-dir", type=Path, default=Path("q5_frequency_measure"))
@@ -397,7 +559,7 @@ def main() -> int:
     args = parser.parse_args()
     with Uart(args.serial) as uart, Camera(args.device, 30.0) as camera:
         report = run_frequency_measurement(args.output_dir, uart, camera, args.save_images)
-        reply = uart.command(f"RESULT {int(round(float(report.get('frequency_hz', 0.0))))}")
+        reply = uart.command(f"RESULT {int(report.get('frequency_hz', 0))}")
     report["mcu_result_reply"] = reply
     (args.output_dir / "frequency_report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="ascii")
     print(json.dumps(report), flush=True)

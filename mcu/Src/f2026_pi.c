@@ -89,6 +89,9 @@ static bool parse_line(F2026_PiCommand *command, char *line_buffer)
     } else if ((strcmp(verb, "PHASE") == 0) && (arg1 != 0)) {
         command->type = F2026_PI_COMMAND_PHASE;
         command->value = strtoul(arg1, 0, 10);
+    } else if ((strcmp(verb, "PHASEQ") == 0) && (arg1 != 0)) {
+        command->type = F2026_PI_COMMAND_PHASE_FINE;
+        command->value = strtoul(arg1, 0, 10);
     } else if ((strcmp(verb, "CAL") == 0) && (arg1 != 0) && (arg2 != 0)) {
         command->type = F2026_PI_COMMAND_CALIBRATE;
         command->value = strtoul(arg1, 0, 10);
@@ -173,12 +176,21 @@ void F2026_PiReply(const char *text)
     }
 }
 
-void F2026_PiNotifyMeasureRequest(void)
+void F2026_PiNotifyMeasureRequest(uint8_t task_number)
 {
-    static const char request[] = "MEASURE\r\n";
+    static const char *const requests[3] = {
+        "MEASURE 1\r\n",
+        "MEASURE 2\r\n",
+        "MEASURE 3\r\n",
+    };
+
+    if ((task_number < 1U) || (task_number > 3U)) {
+        return;
+    }
 
     /* The Orange Pi is wired to USART3 (PB10/PB11), independently of the
        port that most recently issued a configuration command. */
-    (void)BSP_UART_Transmit(&huart3, (const uint8_t *)request,
-                            (uint16_t)(sizeof(request) - 1U), 100U);
+    (void)BSP_UART_Transmit(&huart3,
+                            (const uint8_t *)requests[task_number - 1U],
+                            (uint16_t)strlen(requests[task_number - 1U]), 100U);
 }

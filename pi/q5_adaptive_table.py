@@ -1,7 +1,7 @@
 """Experimental Q5 visual binary search using FPGA ramp-table control.
 
 This intentionally does not replace q5_fpga_sweep.py. It is a SRAM-test
-entry point: STEP 0..31 selects a 2 ms-frame table entry. STEP 32 is used only
+entry point: STEP 0..31 selects a 10 ms-frame table entry. STEP 32 is used only
 after normal measurement fails, and selects the 2 ms-ramp / 10 ms-frame
 low-frequency fallback. Only selected camera frames remain in memory unless
 --save-images is requested.

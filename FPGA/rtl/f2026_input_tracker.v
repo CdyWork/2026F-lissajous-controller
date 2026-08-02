@@ -1,19 +1,24 @@
 `timescale 1ns / 1ps
 
-module f2026_input_tracker (
+module f2026_input_tracker #(
+    parameter [31:0] CALIBRATION_PERIODS = 32'd50000
+) (
     input  wire        clk,
     input  wire        reset_n,
     input  wire        sample_ce,
     input  wire [7:0]  ad_data,
     input  wire        ad_otr,
     input  wire [7:0]  threshold_hysteresis,
+    input  wire        calibration_start,
     output reg         edge_pulse = 1'b0,
     output reg         locked = 1'b0,
     output reg [31:0]  period_ticks = 32'd0,
     output reg [31:0]  edge_count = 32'd0,
     output reg [7:0]   sample_min = 8'h80,
     output reg [7:0]   sample_max = 8'h80,
-    output reg         otr_seen = 1'b0
+    output reg         otr_seen = 1'b0,
+    output reg         calibration_done = 1'b0,
+    output reg [31:0]  calibration_ticks = 32'd0
 );
     // A 100 kHz input is nominally 500 system clocks. ADC sampling and the
     // hysteresis crossing can move adjacent detected edges by one sample.
@@ -22,6 +27,8 @@ module f2026_input_tracker (
     // board-clock tolerance while still rejecting unrelated slow crossings.
     localparam [31:0] MAX_PERIOD_TICKS = 32'd55000;
     localparam [31:0] EDGE_TIMEOUT_TICKS = 32'd125000;
+    // 50,000 periods of a 100 kHz reference last 0.5 s. One system-clock
+    // count is then only 0.04 ppm, suitable for a quick bench calibration.
 
     reg [31:0] period_counter = 32'd0;
     reg [39:0] period_filter_q8 = 40'd0;
@@ -33,6 +40,11 @@ module f2026_input_tracker (
     reg [15:0] window_count = 16'd0;
     reg [7:0] window_min = 8'hFF;
     reg [7:0] window_max = 8'h00;
+    reg calibration_start_last = 1'b0;
+    reg calibration_wait_first_edge = 1'b0;
+    reg calibration_running = 1'b0;
+    reg [31:0] calibration_counter = 32'd0;
+    reg [31:0] calibration_period_count = 32'd0;
 
     wire [8:0] threshold_low_wide = 9'd128 - {1'b0, threshold_hysteresis};
     wire [8:0] threshold_high_wide = 9'd128 + {1'b0, threshold_hysteresis};
@@ -78,7 +90,26 @@ module f2026_input_tracker (
             sample_min <= 8'h80;
             sample_max <= 8'h80;
             otr_seen <= 1'b0;
+            calibration_start_last <= 1'b0;
+            calibration_wait_first_edge <= 1'b0;
+            calibration_running <= 1'b0;
+            calibration_counter <= 32'd0;
+            calibration_period_count <= 32'd0;
+            calibration_done <= 1'b0;
+            calibration_ticks <= 32'd0;
         end else begin
+            calibration_start_last <= calibration_start;
+            if (calibration_start && !calibration_start_last) begin
+                calibration_wait_first_edge <= 1'b1;
+                calibration_running <= 1'b0;
+                calibration_counter <= 32'd0;
+                calibration_period_count <= 32'd0;
+                calibration_done <= 1'b0;
+                calibration_ticks <= 32'd0;
+            end else if (calibration_running) begin
+                calibration_counter <= calibration_counter + 1'b1;
+            end
+
             if (period_counter < EDGE_TIMEOUT_TICKS)
                 period_counter <= period_counter + 1'b1;
             else begin
@@ -113,6 +144,23 @@ module f2026_input_tracker (
                     low_armed <= 1'b0;
                     edge_pulse <= 1'b1;
                     edge_count <= edge_count + 1'b1;
+
+                    if (calibration_wait_first_edge) begin
+                        calibration_wait_first_edge <= 1'b0;
+                        calibration_running <= 1'b1;
+                        calibration_counter <= 32'd0;
+                        calibration_period_count <= 32'd0;
+                    end else if (calibration_running) begin
+                        if (calibration_period_count >=
+                            CALIBRATION_PERIODS - 1'b1) begin
+                            calibration_running <= 1'b0;
+                            calibration_done <= 1'b1;
+                            calibration_ticks <= calibration_counter;
+                        end else begin
+                            calibration_period_count <=
+                                calibration_period_count + 1'b1;
+                        end
+                    end
 
                     if (!seen_edge) begin
                         seen_edge <= 1'b1;
