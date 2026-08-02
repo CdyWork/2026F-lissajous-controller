@@ -112,19 +112,20 @@ bool F2026_FpgaWriteControl(const F2026_FpgaControl *control)
     tx[3] = (control->output_enable ? 0x01U : 0U) |
             (control->free_run ? 0x02U : 0U) |
             (control->calibration_start ? 0x04U : 0U);
-    pack_u32_le(&tx[4], control->phase_increment);
+    pack_u32_le(&tx[4], (uint32_t)control->phase_increment);
     pack_u32_le(&tx[8], control->phase_offset);
     tx[12] = control->dac_mid;
     tx[13] = control->threshold_hysteresis;
+    tx[14] = (uint8_t)(control->phase_increment >> 32U);
     return transfer_frame(tx, rx);
 }
 
-uint32_t F2026_PhaseIncrementFromHz(uint32_t frequency_hz)
+uint64_t F2026_PhaseIncrementFromHz(uint32_t frequency_hz)
 {
     if ((frequency_hz == 0U) || (frequency_hz > 200000U)) {
         return 0U;
     }
-    return (uint32_t)((((uint64_t)frequency_hz << 32U) +
+    return ((((uint64_t)frequency_hz << 40U) +
                        (F2026_FPGA_CLOCK_HZ / 2ULL)) /
                       F2026_FPGA_CLOCK_HZ);
 }

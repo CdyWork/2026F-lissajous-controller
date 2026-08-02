@@ -46,7 +46,7 @@ module f2026_top (
     wire [7:0] amplitude;
     wire output_enable;
     wire free_run;
-    wire [31:0] phase_increment;
+    wire [39:0] phase_increment;
     wire [31:0] phase_offset;
     wire [7:0] dac_mid;
     wire [7:0] threshold_hysteresis;
@@ -57,7 +57,7 @@ module f2026_top (
     wire tracked_increment_valid;
     wire [31:0] tracking_latency_phase;
     wire [31:0] low_frequency_phase_calibration;
-    wire [31:0] effective_phase_increment;
+    wire [39:0] effective_phase_increment;
     wire [31:0] effective_phase_offset;
     wire output_active;
     reg [18:0] lock_hold_counter = 19'd0;
@@ -126,7 +126,7 @@ module f2026_top (
                (tracked_phase_increment << 2))
             : 32'd0;
     assign effective_phase_increment = free_run
-        ? phase_increment : tracked_phase_increment;
+        ? phase_increment : {tracked_phase_increment, 8'd0};
     assign effective_phase_offset = free_run
         ? phase_offset
         : ((mode == 3'd3)
@@ -137,7 +137,7 @@ module f2026_top (
                low_frequency_phase_calibration +
                tracking_latency_phase));
     assign output_active = output_enable && (mode != 3'd0) &&
-        (free_run ? ((mode == 3'd5) || (phase_increment != 32'd0))
+        (free_run ? ((mode == 3'd5) || (phase_increment != 40'd0))
                   : tracked_output_qualified);
 
     always @(posedge clk_50m) begin

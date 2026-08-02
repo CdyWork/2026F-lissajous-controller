@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define F2026_FPGA_PROTOCOL_VERSION 3U
+#define F2026_FPGA_PROTOCOL_VERSION 4U
 
 typedef enum {
     F2026_FPGA_MODE_IDLE = 0,
@@ -38,7 +38,7 @@ typedef struct {
     bool output_enable;
     bool free_run;
     bool calibration_start;
-    uint32_t phase_increment;
+    uint64_t phase_increment;
     uint32_t phase_offset;
     uint8_t dac_mid;
     uint8_t threshold_hysteresis;
@@ -48,7 +48,7 @@ void F2026_FpgaInterfaceInit(void);
 void F2026_FpgaReset(bool release_reset);
 bool F2026_FpgaReadStatus(F2026_FpgaStatus *status);
 bool F2026_FpgaWriteControl(const F2026_FpgaControl *control);
-uint32_t F2026_PhaseIncrementFromHz(uint32_t frequency_hz);
+uint64_t F2026_PhaseIncrementFromHz(uint32_t frequency_hz);
 uint32_t F2026_PhaseWordFromDegrees(uint32_t degrees);
 
 #endif

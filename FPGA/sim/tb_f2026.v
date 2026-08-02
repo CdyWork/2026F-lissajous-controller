@@ -116,7 +116,7 @@ module tb_f2026;
         input [2:0] requested_mode;
         input [7:0] requested_amplitude;
         input [7:0] requested_flags;
-        input [31:0] requested_increment;
+        input [39:0] requested_increment;
         input [31:0] requested_offset;
         begin
             for (index = 0; index < 16; index = index + 1)
@@ -135,6 +135,7 @@ module tb_f2026;
             tx_frame[11] = requested_offset[31:24];
             tx_frame[12] = 8'h80;
             tx_frame[13] = 8'd3;
+            tx_frame[14] = requested_increment[39:32];
             spi_frame;
         end
     endtask
@@ -180,7 +181,7 @@ module tb_f2026;
 
         read_status;
         check(rx_frame[1] == 8'hF6, "SPI status signature");
-        check(rx_frame[2] == 8'h03, "SPI protocol version");
+        check(rx_frame[2] == 8'h04, "SPI protocol version");
         check(rx_frame[3][0] == 1'b1, "input tracker locked");
         check(({rx_frame[7], rx_frame[6], rx_frame[5], rx_frame[4]} > 32'd4950) &&
               ({rx_frame[7], rx_frame[6], rx_frame[5], rx_frame[4]} < 32'd5050),
@@ -292,8 +293,10 @@ module tb_f2026;
         check((maximum_code - minimum_code) >= 24, "1 Vpp calibrated-code span");
         check((maximum_code - minimum_code) <= 28, "1 Vpp span limit");
 
-        write_control(3'd1, 8'd26, 8'h03, 32'd1717987, 32'd0);
+        write_control(3'd1, 8'd26, 8'h03, 40'd439804651, 32'd0);
         #100000;
+        check(dut.phase_increment == 40'd439804651,
+              "SPI transfers the complete 40-bit free-run tuning word");
         measure_span(12000, minimum_code, maximum_code);
         check((maximum_code - minimum_code) >= 48, "free-run Raspberry Pi path");
 
@@ -354,14 +357,13 @@ module tb_f2026;
 
         // Shortened to 16 input periods by the testbench defparam. Production
         // uses 50,000 periods for a half-second reference calibration.
-        write_control(3'd1, 8'd13, 8'h07, 32'd8589935, 32'd0);
+        write_control(3'd1, 8'd13, 8'h07, 40'd2199023256, 32'd0);
         #300000;
         read_status;
         check(rx_frame[3][4] == 1'b1, "reference calibration completes");
-        check(({rx_frame[11], rx_frame[10], rx_frame[9], rx_frame[8]} >= 32'd7900) &&
-              ({rx_frame[11], rx_frame[10], rx_frame[9], rx_frame[8]} <= 32'd8100),
-              "reference calibration returns 16 periods");
-        write_control(3'd1, 8'd13, 8'h03, 32'd8589935, 32'd0);
+        check({rx_frame[11], rx_frame[10], rx_frame[9], rx_frame[8]} == 32'd8000,
+              "reference calibration returns exact 16-period tick count");
+        write_control(3'd1, 8'd13, 8'h03, 40'd2199023256, 32'd0);
 
         // A full-range frequency step must not wait for the old IIR state to
         // converge over dozens of slow input periods.

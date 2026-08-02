@@ -24,7 +24,7 @@ module f2026_spi_control (
     output reg         output_enable = 1'b0,
     output reg         free_run = 1'b0,
     output reg         calibration_start = 1'b0,
-    output reg  [31:0] phase_increment = 32'd0,
+    output reg  [39:0] phase_increment = 40'd0,
     output reg  [31:0] phase_offset = 32'd0,
     output reg  [7:0]  dac_mid = 8'h80,
     output reg  [7:0]  threshold_hysteresis = 8'd3
@@ -44,7 +44,7 @@ module f2026_spi_control (
     reg [2:0] staged_mode = 3'd0;
     reg [7:0] staged_amplitude = 8'd51;
     reg [7:0] staged_flags = 8'd0;
-    reg [31:0] staged_phase_increment = 32'd0;
+    reg [39:0] staged_phase_increment = 40'd0;
     reg [31:0] staged_phase_offset = 32'd0;
     reg [7:0] staged_dac_mid = 8'h80;
     reg [7:0] staged_hysteresis = 8'd3;
@@ -71,7 +71,7 @@ module f2026_spi_control (
         if (command == CMD_READ_STATUS) begin
             case (byte_index)
                 12'd0:  tx_byte = 8'hF6;
-                12'd1:  tx_byte = 8'h03;
+                12'd1:  tx_byte = 8'h04;
                 12'd2:  tx_byte = {3'd0, calibration_done, free_run,
                                     output_active, otr_seen, input_locked};
                 12'd3:  tx_byte = period_ticks[7:0];
@@ -100,7 +100,7 @@ module f2026_spi_control (
             output_enable <= 1'b0;
             free_run <= 1'b0;
             calibration_start <= 1'b0;
-            phase_increment <= 32'd0;
+            phase_increment <= 40'd0;
             phase_offset <= 32'd0;
             dac_mid <= 8'h80;
             threshold_hysteresis <= 8'd3;
@@ -144,6 +144,7 @@ module f2026_spi_control (
                         12'd11: staged_phase_offset[31:24] <= rx_byte;
                         12'd12: staged_dac_mid <= rx_byte;
                         12'd13: staged_hysteresis <= rx_byte;
+                        12'd14: staged_phase_increment[39:32] <= rx_byte;
                         default: begin end
                     endcase
                 end

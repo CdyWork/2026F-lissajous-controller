@@ -1,13 +1,13 @@
 # 2026F 李萨如图形显示控制装置
 
-当前归档版本：**V6.0（全完成，未整合）**。
+当前归档版本：**V7（代码已经整合，阳式）**。
 
 本仓库当前定版包含前四问实时信号处理，以及第五问的独立视觉测频方案。第五问不从被测信号取得电气测量值：IMX219 只拍摄示波器 XY 画面，香橙派从图形估计频率并回传 STM32 LCD。
 
 ## 当前第五问方案
 
 ```text
-4x4 矩阵键盘 (PD0~PD7) 数字 1/2/3
+4x4 矩阵键盘 (PD0~PD7) 数字 4/5/6
     -> USART3 PB10/PB11: MEASURE <task>
     -> Orange Pi Zero 3W 常驻服务
     -> STM32 SPI1
@@ -40,6 +40,8 @@
 4. `1.1 kHz` 候选固定使用 `STEP 33` 的 `6 ms` 斜坡复核，理论约 6 个过零点；49.9/90.9 kHz 主挡异常时分别使用 `125/69 us` 复核。失败时完整重试一次。
 5. 成功后回传三个标准频点之一；失败时回传 `RESULT 0`。STM32 收到有效 `RESULT` 后立即让 FPGA 输出同频自由运行正弦波。
 
+自由运行正弦波采用 40 位 DDS。100 kHz 参考校准的 FPGA 计数已包含终止边沿时钟，STM32 根据 `CTICKS` 计算 40 位调谐字；其理论残余漂移低于 `0.05°/s` 时不再由香橙派周期性改写相位。相机只在第五问开始时确定静态相位，校准完成后由 FPGA 独立保持。
+
 ## 操作
 
 香橙派服务应保持运行：
@@ -48,7 +50,7 @@
 systemctl --user status q5-fpga-sweep.service
 ```
 
-矩阵键盘数字 `1` 执行测频并把相位归零；数字 `2` 在相位归零后切换为同频 `+90°` 输出；数字 `3` 在相位归零后切换为二倍频输出。任务 3 将静态相位补偿和持续补偿速率同时乘 2，再通过二倍频“∞”图形的自交点复拍校准残余相位。板载第 4 个按键继续作为数字 `1` 的兼容入口。LCD 会在测量完成后显示 `PI` 标记及频率。一次成功测量只采集判别帧和复核帧；失败时再完整重试一次。
+矩阵键盘数字 `1/2/3` 分别执行题目第一至第三问：STM32 先令 FPGA 硬锁定输入频率，再通知香橙派拍摄 XY 图形；香橙派用已知 `+90°` 相位探针确定控制方向，把第一问静态相位归零，并将同一补偿复用于第二问的 `+90°` 和第三问的二倍频输出。需要时会追加 `+30°` 细探针，LCD 显示 `QCAL 1/2/3 RUN/OK/FAIL`。`A` 执行第四问的 `2/4/6/8 div` 幅度循环；数字 `4` 执行第五问任务 1（测频并把相位归零），数字 `5` 执行任务 2（相位归零后切换为同频 `+90°` 输出），数字 `6` 执行任务 3（相位归零后切换为二倍频输出），`B` 执行 100 kHz 参考频率校准。第五问任务 3 将静态相位补偿和持续补偿速率同时乘 2，再通过二倍频“∞”图形的自交点复拍校准残余相位。板载第 4 个按键继续作为第五问任务 1 的兼容入口。LCD 会在测量完成后显示 `PI` 标记及频率。一次成功测量只采集判别帧和复核帧；失败时再完整重试一次。
 
 手动实时触发用于调试：
 
@@ -71,7 +73,9 @@ v4l2-ctl -d /dev/video0 --set-ctrl=auto_exposure=1
 | --- | --- |
 | `pi/q5_frequency_measure.py` | 第五问三频点视觉查表：1.1/49.9/90.9 kHz 最近理论过零数判别与低频复核 |
 | `pi/q5_fpga_sweep.py` | 香橙派常驻服务、IMX219/UART、按键事件和结果回传 |
-| `pi/q5_phase_lock.py` | 基波相位归零、校准时基漂移补偿与任务 3 二倍频自交点校准 |
+| `pi/q5_phase_lock.py` | 数字 1/2/3：输入硬锁相与视觉归正 |
+| `pi/q5_q456_phase_lock.py` | 数字 4/5/6：冻结的第五问测频后相位补偿、40 位 DDS 模型和倍频自交点校准 |
+| `pi/key_tasks/key1_task.py` ... `key6_task.py` | 数字 1~6 的独立任务入口；每次运行前由调度器清除上一任务状态和相机余帧 |
 | `pi/q5-fpga-sweep.service` | 香橙派 systemd user service 定义 |
 | `FPGA/rtl/f2026_waveform_core.v` | FPGA 锯齿波表与 DAC 输出 |
 | `mcu/Src/f2026_app.c` | 按键、USART3 `MEASURE/RESULT`、SPI 配置与 LCD 显示 |
@@ -105,7 +109,7 @@ openocd -f interface/cmsis-dap.cfg -f target/stm32f4x.cfg `
 
 ```powershell
 $q5Key = Join-Path $env:USERPROFILE '.ssh\orangepi_vision_ed25519'
-scp -i $q5Key pi/q5_frequency_measure.py pi/q5_fpga_sweep.py pi/q5_phase_lock.py pi/q5-fpga-sweep.service `
+scp -i $q5Key pi/q5_frequency_measure.py pi/q5_fpga_sweep.py pi/q5_phase_lock.py pi/q5_q456_phase_lock.py pi/q5-fpga-sweep.service `
   orangepi@192.168.242.224:/home/orangepi/2026F/pi/
 ssh -i $q5Key orangepi@192.168.242.224 "`
   cp /home/orangepi/2026F/pi/q5-fpga-sweep.service /home/orangepi/.config/systemd/user/; `
@@ -115,7 +119,9 @@ ssh -i $q5Key orangepi@192.168.242.224 "`
 
 ## 前四问
 
-前四问的实时控制闭环仍在 FPGA 内：ADC 采样、锁相、DDS 与 DAC 输出不依赖香橙派。第五问由矩阵键盘数字 `1/2/3` 选择归零、归零后 `+90°`、归零后二倍频任务。第五问执行期间 STM32 只做任务请求、命令转发和结果显示，不参与频率计算。
+前四问的实时频率控制闭环仍在 FPGA 内：ADC 采样、硬锁相、DDS 与 DAC 输出不依赖香橙派。数字 `1/2/3` 启动后，香橙派只通过示波器 XY 照片校准静态相位；校准完成后 FPGA 独立运行，不需要持续拍照。矩阵键盘 `1/2/3/A` 对应前四问；第五问由数字 `4/5/6` 选择归零、归零后 `+90°`、归零后二倍频任务，`B` 启动参考频率校准。第五问执行期间 STM32 只做任务请求、命令转发和结果显示，不参与频率计算。
+
+数字 `1~6` 在香橙派上分别对应独立任务脚本，但相机和 USART 仍由一个常驻调度器独占，避免多进程抢占硬件。服务启动时只做一次 XY 几何和空白背景标定；每个按键任务开始时都会停止上一任务的相位 servo、令 FPGA 进入 `IDLE` 并丢弃旧画面，随后复用只读标定结果。`A` 和 `B` 是 MCU/FPGA 本地功能，不启动派端脚本。
 
 ## 文档入口
 

@@ -86,6 +86,9 @@ static bool parse_line(F2026_PiCommand *command, char *line_buffer)
     } else if ((strcmp(verb, "FREQ") == 0) && (arg1 != 0)) {
         command->type = F2026_PI_COMMAND_FREQUENCY;
         command->value = strtoul(arg1, 0, 10);
+    } else if ((strcmp(verb, "TRIMQ") == 0) && (arg1 != 0)) {
+        command->type = F2026_PI_COMMAND_FREQUENCY_TRIM;
+        command->value = (uint32_t)strtol(arg1, 0, 10);
     } else if ((strcmp(verb, "PHASE") == 0) && (arg1 != 0)) {
         command->type = F2026_PI_COMMAND_PHASE;
         command->value = strtoul(arg1, 0, 10);
@@ -108,6 +111,16 @@ static bool parse_line(F2026_PiCommand *command, char *line_buffer)
     } else if (strcmp(verb, "RESULT") == 0) {
         command->type = F2026_PI_COMMAND_RESULT;
         command->value = (arg1 == 0) ? 0U : strtoul(arg1, 0, 10);
+    } else if ((strcmp(verb, "TRACKDONE") == 0) &&
+               (arg1 != 0) && (arg2 != 0)) {
+        command->type = F2026_PI_COMMAND_TRACK_RESULT;
+        command->value = strtoul(arg1, 0, 10);
+        command->value2 = strtoul(arg2, 0, 10);
+    } else if ((strcmp(verb, "TASKDONE") == 0) &&
+               (arg1 != 0) && (arg2 != 0)) {
+        command->type = F2026_PI_COMMAND_TASK_RESULT;
+        command->value = strtoul(arg1, 0, 10);
+        command->value2 = strtoul(arg2, 0, 10);
     }
 
     return command->type != F2026_PI_COMMAND_NONE;
@@ -193,4 +206,21 @@ void F2026_PiNotifyMeasureRequest(uint8_t task_number)
     (void)BSP_UART_Transmit(&huart3,
                             (const uint8_t *)requests[task_number - 1U],
                             (uint16_t)strlen(requests[task_number - 1U]), 100U);
+}
+
+void F2026_PiNotifyTrackCalibrationRequest(uint8_t question_number)
+{
+    static const char *const requests[3] = {
+        "TRACKCAL 1\r\n",
+        "TRACKCAL 2\r\n",
+        "TRACKCAL 3\r\n",
+    };
+
+    if ((question_number < 1U) || (question_number > 3U)) {
+        return;
+    }
+
+    (void)BSP_UART_Transmit(&huart3,
+                            (const uint8_t *)requests[question_number - 1U],
+                            (uint16_t)strlen(requests[question_number - 1U]), 100U);
 }

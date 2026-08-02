@@ -155,7 +155,11 @@ module f2026_input_tracker #(
                             CALIBRATION_PERIODS - 1'b1) begin
                             calibration_running <= 1'b0;
                             calibration_done <= 1'b1;
-                            calibration_ticks <= calibration_counter;
+                            // calibration_counter is read before its
+                            // nonblocking increment on this terminal edge.
+                            // Include that clock so the reported interval is
+                            // the exact first-edge to last-edge tick count.
+                            calibration_ticks <= calibration_counter + 1'b1;
                         end else begin
                             calibration_period_count <=
                                 calibration_period_count + 1'b1;

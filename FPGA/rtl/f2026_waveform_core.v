@@ -11,7 +11,7 @@ module f2026_waveform_core #(
     input  wire [2:0]  mode,
     input  wire [7:0]  amplitude,
     input  wire [7:0]  dac_mid,
-    input  wire [31:0] phase_increment,
+    input  wire [39:0] phase_increment,
     input  wire [31:0] phase_offset,
     input  wire        input_edge,
     input  wire        input_locked,
@@ -33,7 +33,7 @@ module f2026_waveform_core #(
     localparam [7:0] PROBE_END_CODE = 8'h00;
     localparam [7:0] PROBE_PARK_CODE = 8'hFF;
 
-    reg [31:0] base_phase = 32'd0;
+    reg [39:0] base_phase = 40'd0;
     reg signed [11:0] sine_pipeline = 12'sd0;
     reg signed [20:0] product_pipeline = 21'sd0;
     reg [31:0] probe_frame_counter = 32'd0;
@@ -175,19 +175,19 @@ module f2026_waveform_core #(
         end
     endfunction
 
-    wire [31:0] running_phase = base_phase + phase_increment;
+    wire [39:0] running_phase = base_phase + phase_increment;
     wire tracking_edge = input_edge && input_locked && !free_run;
-    wire [31:0] base_phase_next = tracking_edge ? 32'd0 : running_phase;
+    wire [39:0] base_phase_next = tracking_edge ? 40'd0 : running_phase;
     reg [31:0] selected_phase;
 
     always @* begin
         case (mode)
             MODE_CIRCLE:
-                selected_phase = base_phase_next + 32'h4000_0000 + phase_offset;
+                selected_phase = base_phase_next[39:8] + 32'h4000_0000 + phase_offset;
             MODE_DOUBLE:
-                selected_phase = {base_phase_next[30:0], 1'b0} + phase_offset;
+                selected_phase = {base_phase_next[38:8], 1'b0} + phase_offset;
             MODE_DIAGONAL:
-                selected_phase = base_phase_next + phase_offset;
+                selected_phase = base_phase_next[39:8] + phase_offset;
             default:
                 selected_phase = phase_offset;
         endcase
@@ -205,7 +205,7 @@ module f2026_waveform_core #(
         (probe_table_mode ? probe_table_frame_ticks(probe_table_index) : phase_offset);
     wire [31:0] probe_ramp_ticks = probe_sweep_mode
         ? probe_sweep_ramp_ticks(probe_sweep_index) :
-        (probe_table_mode ? probe_table_ramp_ticks(probe_table_index) : phase_increment);
+        (probe_table_mode ? probe_table_ramp_ticks(probe_table_index) : phase_increment[31:0]);
     wire probe_valid_ramp = (probe_ramp_ticks != 32'd0) &&
                             (probe_ramp_ticks < probe_frame_ticks);
     wire [8:0] probe_ramp_span =
@@ -214,7 +214,7 @@ module f2026_waveform_core #(
 
     always @(posedge clk) begin
         if (!reset_n) begin
-            base_phase <= 32'd0;
+            base_phase <= 40'd0;
             sine_pipeline <= 12'sd0;
             product_pipeline <= 21'sd0;
             phase_monitor <= 32'd0;
@@ -229,7 +229,7 @@ module f2026_waveform_core #(
             probe_table_index <= 6'd16;
         end else begin
             if (!enable || (mode == MODE_IDLE)) begin
-                base_phase <= 32'd0;
+                base_phase <= 40'd0;
                 sine_pipeline <= 12'sd0;
                 product_pipeline <= 21'sd0;
                 phase_monitor <= 32'd0;
@@ -243,7 +243,7 @@ module f2026_waveform_core #(
                 probe_table_running <= 1'b0;
                 probe_table_index <= 6'd16;
             end else if (probe_mode) begin
-                base_phase <= 32'd0;
+                base_phase <= 40'd0;
                 sine_pipeline <= 12'sd0;
                 product_pipeline <= 21'sd0;
                 phase_monitor <= probe_frame_counter;

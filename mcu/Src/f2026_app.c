@@ -26,6 +26,7 @@
 #define F2026_REFERENCE_CALIBRATION_EXPECTED_TICKS \
     (F2026_REFERENCE_CALIBRATION_PERIODS * \
      (50000000ULL / F2026_REFERENCE_CALIBRATION_HZ))
+#define F2026_REFERENCE_CALIBRATION_SAVED_TICKS 24999942U
 #define F2026_REFERENCE_CALIBRATION_TIMEOUT_MS 3000U
 #define F2026_DEFAULT_PHASE_DEGREES 14U
 #define F2026_DEFAULT_PHASE_WORD 0x09F49F49U
@@ -41,12 +42,16 @@
 #define F2026_PROBE_SWEEP_FIRST_RAMP_US 10U
 #define F2026_PROBE_TABLE_MID_INDEX 16U
 #define F2026_VISION_MEASUREMENT_TIMEOUT_MS 12000U
+#define F2026_TRACK_CALIBRATION_TIMEOUT_MS 15000U
+#define F2026_COMPLETION_BEEP_MS 120U
+#define F2026_MAX_FREQUENCY_TRIM_WORD 1000000L
 typedef struct {
     F2026_FpgaMode mode;
     bool free_run;
     uint8_t amplitude_index;
     uint8_t amplitude_codes[4];
     uint32_t free_frequency_hz;
+    int32_t frequency_trim_word;
     uint32_t probe_ramp_us;
     uint32_t probe_frame_us;
     uint32_t user_phase_word;
@@ -59,6 +64,12 @@ typedef struct {
     bool vision_frequency_valid;
     bool vision_measurement_pending;
     uint32_t vision_measurement_started_ms;
+    uint8_t vision_task_number;
+    bool tracking_calibration_pending;
+    bool tracking_calibration_valid;
+    bool tracking_calibration_failed;
+    uint8_t tracking_calibration_question;
+    uint32_t tracking_calibration_started_ms;
     bool reference_calibration_pending;
     bool reference_calibration_started;
     bool reference_calibration_start_request;
@@ -66,6 +77,8 @@ typedef struct {
     bool reference_calibration_failed;
     uint32_t reference_calibration_ticks;
     uint32_t reference_calibration_started_ms;
+    bool completion_beep_active;
+    uint32_t completion_beep_started_ms;
 } F2026_State;
 
 static const uint8_t amplitude_divisions[4] = {2U, 4U, 6U, 8U};
@@ -75,6 +88,7 @@ static F2026_State state = {
     .amplitude_index = 3U,
     .amplitude_codes = {13U, 26U, 38U, 51U},
     .free_frequency_hz = 1000U,
+    .frequency_trim_word = 0,
     .probe_ramp_us = F2026_PROBE_DEFAULT_RAMP_US,
     .probe_frame_us = F2026_PROBE_DEFAULT_FRAME_US,
     .user_phase_word = F2026_DEFAULT_PHASE_WORD,
@@ -85,27 +99,41 @@ static F2026_State state = {
     .vision_frequency_valid = false,
     .vision_measurement_pending = false,
     .vision_measurement_started_ms = 0U,
+    .vision_task_number = 0U,
+    .tracking_calibration_pending = false,
+    .tracking_calibration_valid = false,
+    .tracking_calibration_failed = false,
+    .tracking_calibration_question = 0U,
+    .tracking_calibration_started_ms = 0U,
     .reference_calibration_pending = false,
     .reference_calibration_started = false,
     .reference_calibration_start_request = false,
-    .reference_calibration_valid = false,
+    .reference_calibration_valid = true,
     .reference_calibration_failed = false,
-    .reference_calibration_ticks = 0U,
-    .reference_calibration_started_ms = 0U
+    .reference_calibration_ticks = F2026_REFERENCE_CALIBRATION_SAVED_TICKS,
+    .reference_calibration_started_ms = 0U,
+    .completion_beep_active = false,
+    .completion_beep_started_ms = 0U
 };
 
 static void F2026_Task(void *argument);
 static void F2026_HardwareInit(void);
 static void F2026_ApplyControl(void);
 static void F2026_ServiceKeys(void);
+static void F2026_SelectTrackingMode(F2026_FpgaMode mode);
+static void F2026_CycleAmplitude(void);
+static void F2026_StartReferenceCalibration(void);
+static void F2026_StartTrackingCalibration(uint8_t question_number);
 static void F2026_StartVisionTask(uint8_t task_number);
 static void F2026_ServicePi(void);
+static void F2026_StartCompletionBeep(void);
+static void F2026_ServiceCompletionBeep(void);
 static void F2026_DrawStatus(void);
 static void F2026_SendPiStatus(void);
 static const char *F2026_ModeName(F2026_FpgaMode mode);
 static int F2026_AmplitudeIndex(uint32_t divisions);
 static bool F2026_IsQ5Frequency(uint32_t frequency_hz);
-static uint32_t F2026_OutputPhaseIncrement(uint32_t frequency_hz);
+static uint64_t F2026_OutputPhaseIncrement(uint32_t frequency_hz);
 
 void F2026_AppStart(void)
 {
@@ -170,6 +198,7 @@ static void F2026_Task(void *argument)
                 state.reference_calibration_failed =
                     !state.reference_calibration_valid;
                 state.last_control_valid = false;
+                F2026_StartCompletionBeep();
             }
 
             if (state.last_control_valid &&
@@ -185,6 +214,7 @@ static void F2026_Task(void *argument)
 
         F2026_ServiceKeys();
         F2026_ServicePi();
+        F2026_ServiceCompletionBeep();
         F2026_ApplyControl();
 
         if (++draw_divider >= 10U) {
@@ -262,36 +292,28 @@ static void F2026_ServiceKeys(void)
 {
     uint16_t event = BSP_Key_Scan();
     char matrix_key = BSP_Keypad_Scan();
+    bool matrix_key_handled = true;
 
     if (state.vision_measurement_pending &&
         ((uint32_t)(HAL_GetTick() - state.vision_measurement_started_ms) >=
          F2026_VISION_MEASUREMENT_TIMEOUT_MS)) {
         state.vision_measurement_pending = false;
     }
+    if (state.tracking_calibration_pending &&
+        ((uint32_t)(HAL_GetTick() - state.tracking_calibration_started_ms) >=
+         F2026_TRACK_CALIBRATION_TIMEOUT_MS)) {
+        state.tracking_calibration_pending = false;
+        state.tracking_calibration_failed = true;
+    }
 
     if ((event & BSP_KEY0_PRESS) != 0U) {
-        state.mode = F2026_FPGA_MODE_DIAGONAL;
-        state.free_run = false;
+        F2026_SelectTrackingMode(F2026_FPGA_MODE_DIAGONAL);
     }
     if ((event & BSP_KEY1_PRESS) != 0U) {
-        state.mode = F2026_FPGA_MODE_CIRCLE;
-        state.free_run = false;
+        F2026_SelectTrackingMode(F2026_FPGA_MODE_CIRCLE);
     }
     if (((event & BSP_KEY2_PRESS) != 0U) && !state.reference_calibration_pending) {
-        state.vision_frequency_hz = 0U;
-        state.vision_frequency_valid = false;
-        state.vision_measurement_pending = false;
-        state.mode = F2026_FPGA_MODE_DIAGONAL;
-        state.free_run = true;
-        state.free_frequency_hz = F2026_REFERENCE_CALIBRATION_HZ;
-        state.reference_calibration_pending = true;
-        state.reference_calibration_started = false;
-        state.reference_calibration_start_request = true;
-        state.reference_calibration_valid = false;
-        state.reference_calibration_failed = false;
-        state.reference_calibration_ticks = 0U;
-        state.reference_calibration_started_ms = HAL_GetTick();
-        state.last_control_valid = false;
+        F2026_StartReferenceCalibration();
     }
 
     if (((event & BSP_KEY3_PRESS) != 0U) &&
@@ -299,8 +321,26 @@ static void F2026_ServiceKeys(void)
         F2026_StartVisionTask(1U);
     }
 
-    if ((matrix_key >= '1') && (matrix_key <= '3')) {
-        F2026_StartVisionTask((uint8_t)(matrix_key - '0'));
+    switch (matrix_key) {
+    case '1':
+    case '2':
+    case '3':
+        F2026_StartTrackingCalibration((uint8_t)(matrix_key - '0'));
+        break;
+    case 'A':
+        F2026_CycleAmplitude();
+        break;
+    case '4':
+    case '5':
+    case '6':
+        F2026_StartVisionTask((uint8_t)(matrix_key - '3'));
+        break;
+    case 'B':
+        F2026_StartReferenceCalibration();
+        break;
+    default:
+        matrix_key_handled = false;
+        break;
     }
 
     if (state.reference_calibration_pending &&
@@ -312,7 +352,7 @@ static void F2026_ServiceKeys(void)
     }
 
     if (((event & (uint16_t)~BSP_KEY3_PRESS) != BSP_KEY_EVENT_NONE) ||
-        ((matrix_key >= '1') && (matrix_key <= '3'))) {
+        matrix_key_handled) {
         BSP_Beep_Write(true);
         vTaskDelay(pdMS_TO_TICKS(15U));
         BSP_Beep_Write(false);
@@ -320,19 +360,123 @@ static void F2026_ServiceKeys(void)
     }
 }
 
-static void F2026_StartVisionTask(uint8_t task_number)
+static void F2026_SelectTrackingMode(F2026_FpgaMode mode)
 {
-    if ((task_number < 1U) || (task_number > 3U) ||
-        state.vision_measurement_pending ||
-        state.reference_calibration_pending) {
+    if (state.vision_measurement_pending || state.reference_calibration_pending ||
+        state.tracking_calibration_pending) {
+        return;
+    }
+
+    state.mode = mode;
+    state.free_run = false;
+    state.vision_frequency_hz = 0U;
+    state.vision_frequency_valid = false;
+    state.tracking_calibration_valid = false;
+    state.tracking_calibration_failed = false;
+    state.last_control_valid = false;
+}
+
+static void F2026_CycleAmplitude(void)
+{
+    if (state.vision_measurement_pending || state.reference_calibration_pending ||
+        state.tracking_calibration_pending) {
+        return;
+    }
+
+    if ((state.mode != F2026_FPGA_MODE_DIAGONAL) &&
+        (state.mode != F2026_FPGA_MODE_CIRCLE) &&
+        (state.mode != F2026_FPGA_MODE_DOUBLE)) {
+        state.mode = F2026_FPGA_MODE_DIAGONAL;
+    }
+    state.free_run = false;
+    state.vision_frequency_hz = 0U;
+    state.vision_frequency_valid = false;
+    state.tracking_calibration_valid = false;
+    state.tracking_calibration_failed = false;
+    state.amplitude_index = (uint8_t)((state.amplitude_index + 1U) % 4U);
+    state.last_control_valid = false;
+}
+
+static void F2026_StartReferenceCalibration(void)
+{
+    if (state.reference_calibration_pending || state.vision_measurement_pending ||
+        state.tracking_calibration_pending) {
         return;
     }
 
     state.vision_frequency_hz = 0U;
     state.vision_frequency_valid = false;
+    state.vision_measurement_pending = false;
+    state.tracking_calibration_valid = false;
+    state.tracking_calibration_failed = false;
+    state.mode = F2026_FPGA_MODE_DIAGONAL;
+    state.free_run = true;
+    state.free_frequency_hz = F2026_REFERENCE_CALIBRATION_HZ;
+    state.reference_calibration_pending = true;
+    state.reference_calibration_started = false;
+    state.reference_calibration_start_request = true;
+    state.reference_calibration_valid = false;
+    state.reference_calibration_failed = false;
+    state.reference_calibration_ticks = 0U;
+    state.reference_calibration_started_ms = HAL_GetTick();
+    state.last_control_valid = false;
+}
+
+static void F2026_StartTrackingCalibration(uint8_t question_number)
+{
+    if ((question_number < 1U) || (question_number > 3U) ||
+        state.tracking_calibration_pending || state.vision_measurement_pending ||
+        state.reference_calibration_pending) {
+        return;
+    }
+
+    state.mode = F2026_FPGA_MODE_DIAGONAL;
+    state.free_run = false;
+    state.user_phase_word = F2026_DEFAULT_PHASE_WORD;
+    state.vision_frequency_hz = 0U;
+    state.vision_frequency_valid = false;
+    state.tracking_calibration_pending = true;
+    state.tracking_calibration_valid = false;
+    state.tracking_calibration_failed = false;
+    state.tracking_calibration_question = question_number;
+    state.tracking_calibration_started_ms = HAL_GetTick();
+    state.last_control_valid = false;
+    F2026_PiNotifyTrackCalibrationRequest(question_number);
+}
+
+static void F2026_StartVisionTask(uint8_t task_number)
+{
+    if ((task_number < 1U) || (task_number > 3U) ||
+        state.vision_measurement_pending ||
+        state.reference_calibration_pending ||
+        state.tracking_calibration_pending) {
+        return;
+    }
+
+    state.vision_frequency_hz = 0U;
+    state.vision_frequency_valid = false;
+    state.frequency_trim_word = 0;
     state.vision_measurement_pending = true;
     state.vision_measurement_started_ms = HAL_GetTick();
+    state.vision_task_number = task_number;
     F2026_PiNotifyMeasureRequest(task_number);
+}
+
+static void F2026_StartCompletionBeep(void)
+{
+    state.completion_beep_active = true;
+    state.completion_beep_started_ms = HAL_GetTick();
+    BSP_Beep_Write(true);
+}
+
+static void F2026_ServiceCompletionBeep(void)
+{
+    if (state.completion_beep_active &&
+        ((uint32_t)(HAL_GetTick() - state.completion_beep_started_ms) >=
+         F2026_COMPLETION_BEEP_MS)) {
+        BSP_Beep_Write(false);
+        state.completion_beep_active = false;
+    }
 }
 
 static void F2026_ServicePi(void)
@@ -402,6 +546,20 @@ static void F2026_ServicePi(void)
                 F2026_PiReply("ERR PHASEQ\r\n");
             }
             break;
+        case F2026_PI_COMMAND_FREQUENCY_TRIM: {
+            int32_t trim_word = (int32_t)command.value;
+            if ((trim_word >= -F2026_MAX_FREQUENCY_TRIM_WORD) &&
+                (trim_word <= F2026_MAX_FREQUENCY_TRIM_WORD) &&
+                state.free_run) {
+                state.frequency_trim_word = trim_word;
+                state.last_control_valid = false;
+                F2026_ApplyControl();
+                F2026_PiReply("OK TRIMQ\r\n");
+            } else {
+                F2026_PiReply("ERR TRIMQ\r\n");
+            }
+            break;
+        }
         case F2026_PI_COMMAND_CALIBRATE:
             amplitude_index = F2026_AmplitudeIndex(command.value);
             if ((amplitude_index >= 0) &&
@@ -481,6 +639,30 @@ static void F2026_ServicePi(void)
                 F2026_PiReply("ERR RESULT\r\n");
             }
             break;
+        case F2026_PI_COMMAND_TRACK_RESULT:
+            if (state.tracking_calibration_pending &&
+                (command.value == state.tracking_calibration_question) &&
+                (command.value2 <= 1U)) {
+                state.tracking_calibration_pending = false;
+                state.tracking_calibration_valid = command.value2 == 1U;
+                state.tracking_calibration_failed = command.value2 == 0U;
+                F2026_PiReply("OK TRACKDONE\r\n");
+                F2026_StartCompletionBeep();
+            } else {
+                F2026_PiReply("ERR TRACKDONE\r\n");
+            }
+            break;
+        case F2026_PI_COMMAND_TASK_RESULT:
+            if ((command.value >= 1U) && (command.value <= 3U) &&
+                (command.value == state.vision_task_number) &&
+                (command.value2 <= 1U)) {
+                state.vision_task_number = 0U;
+                F2026_PiReply("OK TASKDONE\r\n");
+                F2026_StartCompletionBeep();
+            } else {
+                F2026_PiReply("ERR TASKDONE\r\n");
+            }
+            break;
         default:
             F2026_PiReply("ERR COMMAND\r\n");
             break;
@@ -547,7 +729,19 @@ static void F2026_DrawStatus(void)
                        state.fpga_status.otr_seen ? BSP_LCD_RED : BSP_LCD_GREEN,
                        BSP_LCD_BLACK);
 
-    if (state.reference_calibration_pending ||
+    if (state.tracking_calibration_pending ||
+        state.tracking_calibration_valid ||
+        state.tracking_calibration_failed) {
+        BSP_LCD_ShowString(0U, 84U, "QCAL", BSP_LCD_CYAN, BSP_LCD_BLACK);
+        BSP_LCD_ShowU32(40U, 84U, state.tracking_calibration_question,
+                        BSP_LCD_WHITE, BSP_LCD_BLACK);
+        BSP_LCD_ShowString(56U, 84U,
+                           state.tracking_calibration_pending ? "RUN" :
+                           state.tracking_calibration_valid ? "OK" : "FAIL",
+                           state.tracking_calibration_pending ? BSP_LCD_YELLOW :
+                           state.tracking_calibration_valid ? BSP_LCD_GREEN : BSP_LCD_RED,
+                           BSP_LCD_BLACK);
+    } else if (state.reference_calibration_pending ||
         state.reference_calibration_valid ||
         state.reference_calibration_failed) {
         BSP_LCD_ShowString(0U, 84U, "CAL", BSP_LCD_CYAN, BSP_LCD_BLACK);
@@ -579,7 +773,7 @@ static void F2026_DrawStatus(void)
                        state.output_active ? BSP_LCD_GREEN : BSP_LCD_YELLOW,
                        BSP_LCD_BLACK);
 
-    BSP_LCD_ShowString(0U, 116U, "KP1:0 KP2:90 KP3:2X", BSP_LCD_GRAY, BSP_LCD_BLACK);
+    BSP_LCD_ShowString(0U, 116U, "Q:123A T:456 B:CAL", BSP_LCD_GRAY, BSP_LCD_BLACK);
 }
 
 static void F2026_SendPiStatus(void)
@@ -608,8 +802,8 @@ static void F2026_SendPiStatus(void)
                    state.output_active ? 1U : 0U,
                    state.communication_ok ? 1U : 0U,
                    state.fpga_status.output_enabled ? 1U : 0U,
-                   state.fpga_status.calibration_done ? 1U : 0U,
-                   (unsigned long)state.fpga_status.calibration_ticks,
+                    state.reference_calibration_valid ? 1U : 0U,
+                    (unsigned long)state.reference_calibration_ticks,
                    state.fpga_status.protocol_version);
     F2026_PiReply(response);
 }
@@ -651,18 +845,20 @@ static bool F2026_IsQ5Frequency(uint32_t frequency_hz)
            (frequency_hz == F2026_Q5_FREQUENCY_3_HZ);
 }
 
-static uint32_t F2026_OutputPhaseIncrement(uint32_t frequency_hz)
+static uint64_t F2026_OutputPhaseIncrement(uint32_t frequency_hz)
 {
-    uint32_t phase_increment = F2026_PhaseIncrementFromHz(frequency_hz);
+    uint64_t phase_increment = F2026_PhaseIncrementFromHz(frequency_hz);
+    int64_t adjusted_increment;
 
     if (state.reference_calibration_valid &&
         (state.reference_calibration_ticks != 0U)) {
-        phase_increment = (uint32_t)((((uint64_t)phase_increment *
+        phase_increment = ((phase_increment *
                          F2026_REFERENCE_CALIBRATION_EXPECTED_TICKS) +
                         (state.reference_calibration_ticks / 2U)) /
-                       state.reference_calibration_ticks);
+                       state.reference_calibration_ticks;
     }
-    return phase_increment;
+    adjusted_increment = (int64_t)phase_increment + state.frequency_trim_word;
+    return adjusted_increment > 0 ? (uint64_t)adjusted_increment : 1ULL;
 }
 
 void vApplicationMallocFailedHook(void)

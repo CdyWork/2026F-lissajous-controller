@@ -1,4 +1,4 @@
-"""Visual phase lock for the Q5 free-running output in XY scope mode."""
+"""Frozen pre-20.1-kHz phase path for matrix keys 4, 5 and 6."""
 
 from __future__ import annotations
 
@@ -76,9 +76,6 @@ TRACK_MODEL_MIN_IMPROVEMENT_DEGREES = 2.0
 TRACK_FINE_MAX_DEGREES = 35.0
 TRACK_FINAL_REFINE_LIMIT_DEGREES = 15.0
 TRACK_FINAL_REFINE_MAX_DEGREES = 15.0
-TRACK_LINE_CENTER_HALF_WIDTH_PX = 10.0
-TRACK_LINE_MIN_CENTER_OCCUPANCY = 0.55
-TRACK_LINE_MAX_MEDIAN_HALF_WIDTH_PX = 10.0
 TRACK_Q2_VERIFY_ERROR_DEGREES = 15.0
 
 
@@ -184,21 +181,6 @@ def capture_phase_error(
         raise RuntimeError("phase trace has insufficient XY span")
     correlation = float(covariance[0, 1] / np.sqrt(variance_x * variance_y))
     correlation = float(np.clip(correlation, -1.0, 1.0))
-    centered_points = points - np.median(points, axis=0)
-    _, eigenvectors = np.linalg.eigh(covariance)
-    major_minor = centered_points @ eigenvectors[:, ::-1]
-    major = major_minor[:, 0]
-    minor = major_minor[:, 1]
-    major_extent = float(np.percentile(np.abs(major), 95.0))
-    central_minor = np.abs(minor[np.abs(major) < 0.5 * major_extent])
-    if len(central_minor) == 0:
-        line_center_occupancy = 0.0
-        line_median_half_width = float("inf")
-    else:
-        line_center_occupancy = float(np.mean(
-            central_minor < TRACK_LINE_CENTER_HALF_WIDTH_PX
-        ))
-        line_median_half_width = float(np.median(central_minor))
     # Normalize the unequal screen gains before fitting. The ellipse axis
     # ratio is tan(|phi| / 2), unlike pixel covariance it is not biased by
     # the non-uniform density of a rasterized ellipse outline.
@@ -233,8 +215,6 @@ def capture_phase_error(
         "threshold": float(blue_threshold),
         "background_gain": background_gain,
         "components": float(kept_components),
-        "line_center_occupancy": line_center_occupancy,
-        "line_median_half_width_px": line_median_half_width,
     }
 
 

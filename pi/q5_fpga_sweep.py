@@ -8,6 +8,7 @@ stable frames, rectifies every capture to 400x400, and removes the blank frame.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import select
@@ -42,8 +43,20 @@ MIN_TRACE_FOREGROUND_PIXELS = 200
 MAX_MEASUREMENT_ATTEMPTS = 5
 SERVICE_SOCKET_PATH = "/tmp/q5_fpga_sweep.sock"
 KEY_MEASURE_EVENT = b"MEASURE"
+KEY_TRACK_CAL_EVENT = b"TRACKCAL"
 KEY_MEASURE_TASKS = (1, 2, 3)
+KEY_TRACK_CAL_QUESTIONS = (1, 2, 3)
+KEY_TASK_MODULES = {
+    ("track_cal", 1): "key_tasks.key1_task",
+    ("track_cal", 2): "key_tasks.key2_task",
+    ("track_cal", 3): "key_tasks.key3_task",
+    ("measure", 1): "key_tasks.key4_task",
+    ("measure", 2): "key_tasks.key5_task",
+    ("measure", 3): "key_tasks.key6_task",
+}
 KEY_MEASURE_OUTPUT_ROOT = Path("/home/orangepi/2026F")
+KEY_TASK_CLEAR_S = 0.80
+KEY_TASK_FLUSH_FRAMES = 8
 TRACE_THRESHOLD = 18
 REPRESENTATIVE_TARGET_MS = 250.0
 MIN_VERTEX_COUNT = 3
@@ -69,6 +82,12 @@ XY_HINT = np.array(
 class CameraFrame:
     timestamp_s: float
     bgr: np.ndarray
+
+
+@dataclass(frozen=True)
+class KeypadEvent:
+    kind: str
+    task_number: int
 
 
 @dataclass(frozen=True)
@@ -155,20 +174,31 @@ class Camera:
         self.stop()
 
 
-def parse_key_measure_event(line: bytes) -> int | None:
-    """Decode MCU keypad notifications; bare MEASURE remains task 1."""
+def parse_keypad_event(line: bytes) -> KeypadEvent | None:
+    """Decode Q5 measurement and Q1-Q3 hard-lock calibration events."""
     fields = line.strip().upper().split()
-    if not fields or fields[0] != KEY_MEASURE_EVENT:
+    if not fields:
         return None
-    if len(fields) == 1:
-        return 1
+    event_name = fields[0]
+    if event_name == KEY_MEASURE_EVENT and len(fields) == 1:
+        return KeypadEvent("measure", 1)
     if len(fields) != 2:
         return None
     try:
         task_number = int(fields[1])
     except ValueError:
         return None
-    return task_number if task_number in KEY_MEASURE_TASKS else None
+    if event_name == KEY_MEASURE_EVENT and task_number in KEY_MEASURE_TASKS:
+        return KeypadEvent("measure", task_number)
+    if event_name == KEY_TRACK_CAL_EVENT and task_number in KEY_TRACK_CAL_QUESTIONS:
+        return KeypadEvent("track_cal", task_number)
+    return None
+
+
+def parse_key_measure_event(line: bytes) -> int | None:
+    """Compatibility wrapper for callers that only accept MEASURE events."""
+    event = parse_keypad_event(line)
+    return event.task_number if event is not None and event.kind == "measure" else None
 
 
 class Uart:
@@ -178,7 +208,7 @@ class Uart:
         self.timeout_s = timeout_s
         self.serial = None
         self.fd = -1
-        self.pending_events: list[int] = []
+        self.pending_events: list[KeypadEvent] = []
         try:
             import serial
         except ImportError:
@@ -210,9 +240,9 @@ class Uart:
             deadline = time.monotonic() + self.timeout_s
             while time.monotonic() < deadline:
                 line = self.serial.readline().strip()
-                measure_task = parse_key_measure_event(line)
-                if measure_task is not None:
-                    self.pending_events.append(measure_task)
+                keypad_event = parse_keypad_event(line)
+                if keypad_event is not None:
+                    self.pending_events.append(keypad_event)
                     continue
                 return line.decode("ascii", errors="replace")
             return ""
@@ -232,14 +262,14 @@ class Uart:
                 if byte == b"\n":
                     break
             line = b"".join(response).strip()
-            measure_task = parse_key_measure_event(line)
-            if measure_task is not None:
-                self.pending_events.append(measure_task)
+            keypad_event = parse_keypad_event(line)
+            if keypad_event is not None:
+                self.pending_events.append(keypad_event)
                 continue
             return line.decode("ascii", errors="replace")
         return ""
 
-    def pop_event(self) -> int | None:
+    def pop_event(self) -> KeypadEvent | None:
         if not self.pending_events:
             return None
         return self.pending_events.pop(0)
@@ -960,11 +990,16 @@ def service_loop(args: argparse.Namespace) -> int:
                     prepare_idle_cache,
                     run_frequency_measurement,
                 )
-                from q5_phase_lock import (
-                    calibrate_double_phase,
-                    capture_phase_error,
+                from q5_q456_phase_lock import (
+                    calibrate_double_phase as calibrate_q456_double_phase,
+                    capture_phase_error as capture_q456_phase_error,
                     start_q5_phase_feedforward,
                     run_q5_phase_lock,
+                )
+                from q5_phase_lock import (
+                    capture_double_phase_error,
+                    capture_phase_error,
+                    run_tracking_phase_calibration,
                 )
 
                 idle_cache = prepare_idle_cache(uart, camera)
@@ -975,6 +1010,18 @@ def service_loop(args: argparse.Namespace) -> int:
                     if time.monotonic() - idle_cache.captured_at_s > CACHED_BLANK_MAX_AGE_S:
                         idle_cache = prepare_idle_cache(uart, camera)
                     return idle_cache
+
+                def reset_key_task_environment() -> None:
+                    nonlocal phase_servo
+                    phase_servo = None
+                    reply = uart.command("IDLE")
+                    if not reply.startswith("OK IDLE"):
+                        raise RuntimeError(f"cannot isolate keypad task: {reply!r}")
+                    time.sleep(KEY_TASK_CLEAR_S)
+                    frame_period_s = 1.0 / max(camera.fps, 1.0)
+                    for _ in range(KEY_TASK_FLUSH_FRAMES):
+                        time.sleep(frame_period_s)
+                        camera.capture()
 
                 def apply_result_and_phase_lock(
                     report: dict[str, object], output_dir: Path,
@@ -990,10 +1037,10 @@ def service_loop(args: argparse.Namespace) -> int:
                     report["mcu_result_reply"] = send_measurement_result(uart, report)
                     if "frequency_hz" not in report:
                         return report
+                    cache = current_idle_cache()
                     try:
                         reference_calibration = read_reference_calibration(uart)
                         report["reference_calibration"] = reference_calibration
-                        cache = current_idle_cache()
                         initial_lock = run_q5_phase_lock(
                             uart, camera, cache.corners, cache.blank
                         )
@@ -1005,9 +1052,14 @@ def service_loop(args: argparse.Namespace) -> int:
                             output_dir / "phase" if save_images else None,
                         )
                         report["phase_feedforward"] = feedforward_report
+                        if not bool(feedforward_report.get("static_accepted", False)):
+                            raise RuntimeError(
+                                "base phase did not reach the zero-phase tolerance"
+                            )
                     except Exception as error:
                         # Preserve the valid frequency result even if an XY
                         # camera frame is unsuitable for phase refinement.
+                        phase_servo = None
                         report["phase_lock"] = {"status": "failed", "reason": str(error)}
                         return report
 
@@ -1032,7 +1084,7 @@ def service_loop(args: argparse.Namespace) -> int:
                         double_phase_calibration = None
                         if task_number == 3:
                             try:
-                                double_phase_calibration = calibrate_double_phase(
+                                double_phase_calibration = calibrate_q456_double_phase(
                                     phase_servo,
                                     camera,
                                     cache.corners,
@@ -1062,7 +1114,7 @@ def service_loop(args: argparse.Namespace) -> int:
                         }
                     return report
 
-                def run_key_measurement_event(task_number: int) -> None:
+                def run_key_measurement_event(task_number: int) -> dict[str, object]:
                     output_dir = key_measurement_output_dir(args.key_output_root)
                     print(json.dumps({
                         "key_measure": True,
@@ -1083,6 +1135,141 @@ def service_loop(args: argparse.Namespace) -> int:
                         except Exception:
                             pass
                         print(json.dumps({"key_measure_error": str(error)}), flush=True)
+                        report = {"status": "failed", "reason": str(error)}
+
+                    phase_ok = (
+                        "frequency_hz" in report
+                        and isinstance(report.get("phase_feedforward"), dict)
+                        and bool(report["phase_feedforward"].get("static_accepted", False))
+                    )
+                    post_output = report.get("post_output")
+                    if task_number >= 2:
+                        phase_ok = (
+                            phase_ok
+                            and isinstance(post_output, dict)
+                            and post_output.get("status") == "running"
+                        )
+                    if task_number == 3 and isinstance(post_output, dict):
+                        double_calibration = post_output.get("double_phase_calibration")
+                        phase_ok = (
+                            phase_ok
+                            and isinstance(double_calibration, dict)
+                            and double_calibration.get("status") != "failed"
+                        )
+                    try:
+                        completion = uart.command(
+                            f"TASKDONE {task_number} {1 if phase_ok else 0}"
+                        )
+                        report["mcu_taskdone_reply"] = completion
+                    except Exception as completion_error:
+                        report["mcu_taskdone_reply"] = f"failed: {completion_error}"
+                    return report
+
+                def run_tracking_calibration_event(
+                    question_number: int,
+                ) -> dict[str, object]:
+                    nonlocal phase_servo
+                    phase_servo = None
+                    print(json.dumps({
+                        "tracking_calibration": True,
+                        "question_number": question_number,
+                    }), flush=True)
+                    success = False
+                    report: dict[str, object] = {
+                        "status": "failed",
+                        "question_number": question_number,
+                    }
+                    errors: list[str] = []
+                    cache = current_idle_cache()
+                    for attempt in (1,):
+                        try:
+                            report = run_tracking_phase_calibration(
+                                uart,
+                                camera,
+                                cache.corners,
+                                cache.blank,
+                                question_number,
+                            )
+                            report["attempt"] = attempt
+                            success = True
+                            print(json.dumps({
+                                "tracking_calibration_complete": True,
+                                "report": report,
+                            }), flush=True)
+                            break
+                        except Exception as error:
+                            errors.append(str(error))
+                            print(json.dumps({
+                                "tracking_calibration_retry": False,
+                                "attempt": attempt,
+                                "reason": str(error),
+                                "question_number": question_number,
+                            }), flush=True)
+                    if not success:
+                        report["reason"] = errors[-1]
+                        report["attempt_errors"] = errors
+                        try:
+                            uart.command("TRACK DIAG")
+                        except Exception:
+                            pass
+                    completion = uart.command(
+                        f"TRACKDONE {question_number} {1 if success else 0}"
+                    )
+                    if not completion.startswith("OK TRACKDONE"):
+                        print(json.dumps({
+                            "tracking_calibration_completion_error": completion,
+                            "question_number": question_number,
+                        }), flush=True)
+                    return report
+
+                def run_keypad_event(event: KeypadEvent) -> dict[str, object]:
+                    module_name = KEY_TASK_MODULES.get((event.kind, event.task_number))
+                    if module_name is None:
+                        return {"status": "failed", "reason": "unknown keypad event"}
+                    try:
+                        reset_key_task_environment()
+                        module = importlib.import_module(module_name)
+                        module = importlib.reload(module)
+                        print(json.dumps({
+                            "key_task_script": module_name,
+                            "event_kind": event.kind,
+                            "task_number": event.task_number,
+                        }), flush=True)
+                        report = module.run(
+                            run_tracking=run_tracking_calibration_event,
+                            run_measurement=run_key_measurement_event,
+                        )
+                        return {
+                            "status": "complete",
+                            "script": module_name,
+                            "report": report,
+                        }
+                    except Exception as error:
+                        if event.kind == "measure":
+                            try:
+                                send_measurement_result(uart, {})
+                            except Exception:
+                                pass
+                            try:
+                                uart.command(f"TASKDONE {event.task_number} 0")
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                uart.command(
+                                    f"TRACKDONE {event.task_number} 0"
+                                )
+                            except Exception:
+                                pass
+                        print(json.dumps({
+                            "key_task_script_error": str(error),
+                            "script": module_name,
+                        }), flush=True)
+                        return {
+                            "status": "failed",
+                            "script": module_name,
+                            "reason": str(error),
+                        }
 
                 uart_line = bytearray()
                 while True:
@@ -1100,6 +1287,7 @@ def service_loop(args: argparse.Namespace) -> int:
                         connection, _ = listener.accept()
                         with connection, connection.makefile("rwb") as stream:
                             request_line = stream.readline(8192)
+                            command = ""
                             try:
                                 request = json.loads(request_line.decode("ascii"))
                                 command = str(request.get("command", "")).upper()
@@ -1119,12 +1307,56 @@ def service_loop(args: argparse.Namespace) -> int:
                                         response, Path(output_value),
                                         bool(request.get("save_images", False)), task_number,
                                     )
+                                elif command == "TRACK_CAL":
+                                    question_number = int(request.get("question_number", 1))
+                                    diagnostic_value = request.get("diagnostic_dir")
+                                    diagnostic_dir = (
+                                        Path(str(diagnostic_value))
+                                        if diagnostic_value else None
+                                    )
+                                    cache = current_idle_cache()
+                                    response = run_tracking_phase_calibration(
+                                        uart,
+                                        camera,
+                                        cache.corners,
+                                        cache.blank,
+                                        question_number,
+                                        diagnostic_dir,
+                                    )
+                                elif command == "MCU_STATUS":
+                                    response = {"status_reply": uart.command("STATUS")}
+                                elif command == "KEY_TASK":
+                                    key_number = int(request.get("key_number", 0))
+                                    if 1 <= key_number <= 3:
+                                        keypad_event = KeypadEvent("track_cal", key_number)
+                                    elif 4 <= key_number <= 6:
+                                        keypad_event = KeypadEvent("measure", key_number - 3)
+                                    else:
+                                        raise ValueError("KEY_TASK requires key_number 1..6")
+                                    response = run_keypad_event(keypad_event)
                                 elif command == "PHASE_CHECK":
                                     if phase_servo is None:
                                         raise RuntimeError("phase compensation is not running")
                                     if time.monotonic() >= phase_servo.next_due_s:
                                         phase_servo.step()
-                                    phase_error, features = capture_phase_error(
+                                    phase_error, features = capture_q456_phase_error(
+                                        camera, idle_cache.corners, idle_cache.blank
+                                    )
+                                    response = {
+                                        "status": "ok",
+                                        "phase_error_degrees": phase_error,
+                                        "phase_degrees": phase_servo.phase_at(),
+                                        "compensation_rate_degrees_per_s": (
+                                            phase_servo.compensation_rate_degrees_per_s
+                                        ),
+                                        "features": features,
+                                    }
+                                elif command == "DOUBLE_CHECK":
+                                    if phase_servo is None:
+                                        raise RuntimeError("phase compensation is not running")
+                                    if time.monotonic() >= phase_servo.next_due_s:
+                                        phase_servo.step()
+                                    phase_error, features = capture_double_phase_error(
                                         camera, idle_cache.corners, idle_cache.blank
                                     )
                                     response = {
@@ -1140,10 +1372,11 @@ def service_loop(args: argparse.Namespace) -> int:
                                     raise ValueError("unsupported command")
                             except Exception as error:
                                 response = {"status": "service_error", "reason": str(error)}
-                                try:
-                                    response["mcu_result_reply"] = send_measurement_result(uart, {})
-                                except Exception as reply_error:
-                                    response["mcu_result_reply"] = f"failed: {reply_error}"
+                                if command == "MEASURE":
+                                    try:
+                                        response["mcu_result_reply"] = send_measurement_result(uart, {})
+                                    except Exception as reply_error:
+                                        response["mcu_result_reply"] = f"failed: {reply_error}"
                             stream.write((json.dumps(response) + "\n").encode("ascii"))
                             stream.flush()
                     if uart.fileno() in ready:
@@ -1151,14 +1384,14 @@ def service_loop(args: argparse.Namespace) -> int:
                         while b"\n" in uart_line:
                             raw_line, _, remainder = uart_line.partition(b"\n")
                             uart_line = bytearray(remainder)
-                            task_number = parse_key_measure_event(raw_line.rstrip(b"\r"))
-                            if task_number is not None:
-                                run_key_measurement_event(task_number)
+                            keypad_event = parse_keypad_event(raw_line.rstrip(b"\r"))
+                            if keypad_event is not None:
+                                run_keypad_event(keypad_event)
                     while True:
-                        task_number = uart.pop_event()
-                        if task_number is None:
+                        keypad_event = uart.pop_event()
+                        if keypad_event is None:
                             break
-                        run_key_measurement_event(task_number)
+                        run_keypad_event(keypad_event)
                     if phase_servo is not None and time.monotonic() >= phase_servo.next_due_s:
                         try:
                             phase_servo.step()
