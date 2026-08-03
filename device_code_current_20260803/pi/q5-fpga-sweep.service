@@ -1,0 +1,16 @@
+[Unit]
+Description=Q5 FPGA vision frequency measurement service
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/orangepi/2026F
+# Keep a complete 2 ms-frame trace in every IMX219 capture. Auto exposure
+# shortens bright frames and randomly crops the short high-frequency ramp.
+ExecStartPre=/usr/bin/v4l2-ctl -d /dev/video0 --set-ctrl=auto_exposure=1
+ExecStart=/usr/bin/python3 /home/orangepi/2026F/pi/q5_fpga_sweep.py --serve --serial /dev/ttyS2 --device /dev/video0 --socket-path /tmp/q5_fpga_sweep.sock
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

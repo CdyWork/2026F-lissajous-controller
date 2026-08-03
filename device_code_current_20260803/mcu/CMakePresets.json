@@ -1,0 +1,60 @@
+{
+    "version": 3,
+    "configurePresets": [
+        {
+            "name": "default",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "toolchainFile": "${sourceDir}/cmake/gnu-tools-for-stm32.cmake",
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "CMAKE_MAKE_PROGRAM": "E:/MCU-env/pico-sdk-v1.5.1/ninja/ninja.exe",
+                "GNU_ARM_TOOLCHAIN_BIN_DIR": "E:/MCU-env/pico-sdk-v1.5.1/gcc-arm-none-eabi/bin",
+                "STM32CUBE_F4": "E:/MCU-help/STM32HAL/CubePackages/STM32CubeF4",
+                "FREERTOS_ROOT": "E:/RTOS/FreeRTOS",
+
+                "CMSIS_Dvendor": "STMicroelectronics:13",
+                "CMSIS_Dname": "STM32F407VET6",
+                "CMSIS_Dcore": "Cortex-M4",
+                "CMSIS_Dtz": "NO_TZ",
+                "CMSIS_Dfpu": "SP_FPU",
+                "CMSIS_Ddsp": "DSP",
+                "CMSIS_Dmve": "NO_MVE",
+                "CMSIS_Dmpu": "MPU",
+                "CMSIS_Dendian": "Little-endian",
+                "CMSIS_Dsecure": "",
+                "CMSIS_Tcompiler": "GCC"
+            }
+        },
+        {
+            "name": "Debug",
+            "inherits": "default",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "Release",
+            "inherits": "default",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "default",
+            "hidden": true,
+            "configurePreset": "default"
+        },
+                {
+            "name": "Debug",
+            "configurePreset": "Debug"
+        },
+        {
+            "name": "Release",
+            "configurePreset": "Release"
+        }
+    ]
+}
